@@ -1,15 +1,22 @@
-//! CP/M Crunch (`.?Z?`) — the standalone LZW compressor, type `0xfe`.
+//! CP/M Crunch (`.?Z?`) — the standalone CP/M compressors, two codecs in one
+//! container.
 //!
-//! This is a different algorithm from the ARC-era [`crunch`](crate::crunch)
-//! module: it is the CP/M `CRUNCH` utility's adaptive LZW, with a 4096-entry
-//! string table indexed through a separate hash table, variable-width codes
-//! (9–12 bits) in the "new" variant or fixed 12-bit codes in the "old" one,
-//! and special reset / filler codes. The LZW output is then run through RLE90
-//! ("type 2"), and an optional trailing byte-sum checksum guards the result.
+//! These are different algorithms from the ARC-era [`crunch`](crate::crunch)
+//! module:
 //!
-//! Faithful port of XADMaster's `XADCrunchHandles.m` (`CRUNCHuncrunch` and the
-//! `XADCrunchZHandle` wiring). The LZHUF variant (type `0xfd`) is a separate
-//! roadmap item and is recognized but not decoded here.
+//! - **Type `0xfe` ("Crunch", LZW):** the CP/M `CRUNCH` utility's adaptive LZW,
+//!   with a 4096-entry string table indexed through a separate hash table,
+//!   variable-width codes (9–12 bits) in the "new" variant or fixed 12-bit
+//!   codes in the "old" one, and special reset / filler codes. The LZW output
+//!   is then run through RLE90 ("type 2").
+//! - **Type `0xfd` ("CrLZH", LZHUF):** the `CRLZH` utility's adaptive Huffman
+//!   over a 4096-byte LZSS window. There is no RLE90 layer — the decoder output
+//!   is the final data.
+//!
+//! Both share the same header and the optional trailing 16-bit byte-sum
+//! checksum. Faithful port of XADMaster's `XADCrunchHandles.m`
+//! (`CRUNCHuncrunch` / `XADCrunchZHandle` for LZW, `DecrAMPK3` /
+//! `XADCrunchYHandle` for LZHUF).
 
 use std::io::{self, Read, Write};
 
@@ -370,6 +377,264 @@ impl<R: Read> Read for CrunchCpmReader<R> {
     }
 }
 
+// --- LZHUF codec (type 0xfd, "CrLZH") -------------------------------------
+//
+// Faithful port of XADMaster's `DecrAMPK3` (`XADCrunchHandles.m`): the CP/M
+// `CRLZH` utility's adaptive-Huffman + 4096-byte LZSS scheme. Symbols are read
+// MSB-first by descending an adaptive Huffman tree; literals go straight to the
+// sliding window, length symbols are followed by an offset code. There is no
+// RLE90 layer — the decoder output is the final data.
+
+const THRESHOLD: usize = 2; // both supported variants use threshold 2
+const LZ_N: usize = 4096; // sliding-window size
+const LZ_F: usize = 60; // longest match
+const N_CHAR: usize = 256 + 1 - THRESHOLD + LZ_F; // 315 leaf symbols
+const LZ_T: usize = N_CHAR * 2 - 1; // 629 tree nodes
+const LZ_R: usize = LZ_T - 1; // 628, root position
+const MAX_FREQ: u16 = 0x8000; // rebuild the tree when the root reaches this
+const K_INIT: usize = LZ_N - LZ_F; // 4036, initial window write pointer
+
+/// Offset high-part decode tables (`AMPK3_d_code` / `AMPK3_d_len`), copied
+/// verbatim from XADMaster.
+#[rustfmt::skip]
+const D_CODE: [u8; 256] = [
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+	3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,
+	6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7,8,8,8,8,8,8,8,8,9,9,9,9,9,9,9,9,
+	10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,
+	12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15,
+	16,16,16,16,17,17,17,17,18,18,18,18,19,19,19,19,
+	20,20,20,20,21,21,21,21,22,22,22,22,23,23,23,23,
+	24,24,25,25,26,26,27,27,28,28,29,29,30,30,31,31,
+	32,32,33,33,34,34,35,35,36,36,37,37,38,38,39,39,
+	40,40,41,41,42,42,43,43,44,44,45,45,46,46,47,47,
+	48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+];
+#[rustfmt::skip]
+const D_LEN: [u8; 256] = [
+	3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
+	4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
+	4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
+	5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
+	5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+	6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+	7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+	7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+];
+
+/// Streaming CP/M `CRLZH` (LZHUF) decoder. Unlike the LZW codec there is no
+/// RLE90 layer; the output is the final data.
+pub struct CrunchLzhufReader<R> {
+    bits: BitReaderMsb<R>,
+    bitnum: u32,
+
+    freq: Vec<u16>,
+    son: Vec<u16>,
+    parent: Vec<u16>,
+    window: Vec<u8>,
+    k: usize,
+
+    out: Vec<u8>,
+    out_pos: usize,
+    done: bool,
+}
+
+impl<R: Read> CrunchLzhufReader<R> {
+    /// Wrap `inner`, selecting the "old" (`type 1`, `bitnum = 6`) or "new"
+    /// (`type 2`, `bitnum = 5`) variant.
+    pub fn new(inner: R, old: bool) -> io::Result<Self> {
+        let mut this = CrunchLzhufReader {
+            bits: BitReaderMsb::new(inner),
+            bitnum: if old { 6 } else { 5 },
+            freq: vec![0; LZ_T + 1],
+            son: vec![0; LZ_T],
+            parent: vec![0; LZ_T + N_CHAR],
+            window: vec![b' '; LZ_N],
+            k: K_INIT,
+            out: Vec::new(),
+            out_pos: 0,
+            done: false,
+        };
+        this.init_tree();
+        Ok(this)
+    }
+
+    /// Build the initial balanced Huffman tree (`StartHuff`).
+    fn init_tree(&mut self) {
+        for i in 0..N_CHAR {
+            self.freq[i] = 1;
+            self.son[i] = (LZ_T + i) as u16;
+            self.parent[LZ_T + i] = i as u16;
+        }
+        let mut j = 0;
+        for i in N_CHAR..=LZ_R {
+            self.freq[i] = self.freq[j] + self.freq[j + 1];
+            self.son[i] = j as u16;
+            self.parent[j] = i as u16;
+            self.parent[j + 1] = i as u16;
+            j += 2;
+        }
+        self.freq[LZ_T] = MAX_FREQ;
+        // window already pre-filled with spaces in `new`; write pointer at K_INIT.
+    }
+
+    /// Read `n` bits MSB-first, erroring on a truncated stream.
+    fn get_bits(&mut self, n: u8) -> io::Result<u32> {
+        if n == 0 {
+            return Ok(0);
+        }
+        self.bits
+            .read(n)?
+            .ok_or_else(|| decrunch("lzhuf: truncated stream (no end indicator)"))
+    }
+
+    /// Rebuild the tree, halving every frequency, when the root reaches
+    /// `MAX_FREQ` (the `reconstruct` block in `DecrAMPK3`).
+    fn reconstruct(&mut self) {
+        let mut dst = 0usize;
+        for n in 0..LZ_T {
+            if self.son[n] as usize >= LZ_T {
+                self.freq[dst] = (self.freq[n] + 1) >> 1;
+                self.son[dst] = self.son[n];
+                dst += 1;
+            }
+        }
+        let mut n = 0usize;
+        for jj in N_CHAR..LZ_T {
+            let f = self.freq[n] + self.freq[n + 1];
+            self.freq[jj] = f;
+            let mut l = jj as i32 - 1;
+            while f < self.freq[l as usize] {
+                l -= 1;
+            }
+            l += 1;
+            let lu = l as usize;
+            let mut m = jj - 1;
+            while m >= lu {
+                self.freq[m + 1] = self.freq[m];
+                self.son[m + 1] = self.son[m];
+                if m == lu {
+                    break;
+                }
+                m -= 1;
+            }
+            self.freq[lu] = f;
+            self.son[lu] = n as u16;
+            n += 2;
+        }
+        for n in 0..LZ_T {
+            let jx = self.son[n] as usize;
+            self.parent[jx] = n as u16;
+            if jx < LZ_T {
+                self.parent[jx + 1] = n as u16;
+            }
+        }
+    }
+
+    /// Splay the just-decoded symbol toward the root, keeping `son` ordered by
+    /// frequency (the `do { ... } while(o)` block in `DecrAMPK3`).
+    fn update(&mut self, leaf_value: usize) {
+        let mut o = self.parent[leaf_value] as usize;
+        loop {
+            self.freq[o] += 1;
+            let j = self.freq[o];
+            if j > self.freq[o + 1] {
+                let mut l = o + 1;
+                while j > self.freq[l + 1] {
+                    l += 1;
+                }
+                self.freq[o] = self.freq[l];
+                self.freq[l] = j;
+                let son_o = self.son[o] as usize;
+                self.parent[son_o] = l as u16;
+                if son_o < LZ_T {
+                    self.parent[son_o + 1] = l as u16;
+                }
+                let m = self.son[l] as usize;
+                self.son[l] = son_o as u16;
+                self.parent[m] = o as u16;
+                if m < LZ_T {
+                    self.parent[m + 1] = o as u16;
+                }
+                self.son[o] = m as u16;
+                o = l;
+            }
+            o = self.parent[o] as usize;
+            if o == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Decode one symbol by descending the tree, then evolve the tree. Returns
+    /// the symbol value (`0..N_CHAR`).
+    fn decode_symbol(&mut self) -> io::Result<usize> {
+        let mut i = self.son[LZ_R] as usize;
+        while i < LZ_T {
+            let bit = self.get_bits(1)? as usize;
+            i = self.son[i + bit] as usize;
+        }
+        if self.freq[LZ_R] == MAX_FREQ {
+            self.reconstruct();
+        }
+        self.update(i);
+        Ok(i - LZ_T)
+    }
+
+    /// One iteration of the main loop. Returns `false` at the end indicator.
+    fn step(&mut self) -> io::Result<bool> {
+        let sym = self.decode_symbol()?;
+        if sym < 0x100 {
+            let b = sym as u8;
+            self.window[self.k] = b;
+            self.k = (self.k + 1) & 0xFFF;
+            self.out.push(b);
+        } else if sym == 0x100 {
+            return Ok(false); // crunch end indicator
+        } else {
+            // A length symbol, followed by an offset code: the high part comes
+            // from the `d_code`/`d_len` prefix tables, the low `bitnum` bits raw.
+            let l8 = self.get_bits(8)? as usize;
+            let m = u32::from(D_LEN[l8]) - (8 - self.bitnum);
+            let low = ((l8 as u32) << m | self.get_bits(m as u8)?) & ((1 << self.bitnum) - 1);
+            let pos = (u32::from(D_CODE[l8]) << self.bitnum) | low;
+            let src = (self.k as u32).wrapping_sub(pos).wrapping_sub(1);
+            let len = sym - (256 - THRESHOLD);
+            for j in 0..len {
+                let b = self.window[((src.wrapping_add(j as u32)) & 0xFFF) as usize];
+                self.window[self.k] = b;
+                self.k = (self.k + 1) & 0xFFF;
+                self.out.push(b);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<R: Read> Read for CrunchLzhufReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut written = 0;
+        while written < buf.len() {
+            if self.out_pos < self.out.len() {
+                buf[written] = self.out[self.out_pos];
+                self.out_pos += 1;
+                written += 1;
+                continue;
+            }
+            if self.done {
+                break;
+            }
+            self.out.clear();
+            self.out_pos = 0;
+            if !self.step()? {
+                self.done = true;
+            }
+        }
+        Ok(written)
+    }
+}
+
 // --- container ------------------------------------------------------------
 
 /// The single member of a Crunch file.
@@ -508,18 +773,12 @@ impl CrunchArchive {
         std::slice::from_ref(&self.entry)
     }
 
-    /// Decode the member and write it to `out`. LZW (`0xfe`) is decoded through
-    /// RLE90 ("type 2") with optional checksum verification; LZHUF (`0xfd`) is
-    /// a separate roadmap item and returns [`io::ErrorKind::Unsupported`].
+    /// Decode the member and write it to `out`, verifying the optional trailing
+    /// byte-sum checksum. LZW (`0xfe`) is decoded through RLE90 ("type 2");
+    /// LZHUF (`0xfd`, "CrLZH") is decoded directly with no RLE90 layer.
     pub fn read_entry(&self, idx: usize, out: &mut dyn Write) -> io::Result<()> {
         if idx != 0 {
             return Err(decrunch("crunch: index out of range"));
-        }
-        if self.crunch_type != 0xfe {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "crunch: LZHUF (type 0xfd) decoding is a separate roadmap item",
-            ));
         }
 
         // The compressed data runs to the end, less the 2-byte checksum if any.
@@ -534,10 +793,17 @@ impl CrunchArchive {
         };
         let comp = &self.data[self.data_offset..end];
 
-        let lzw = CrunchCpmReader::new(comp, self.old)?;
-        let mut rle = Rle90Reader::new_type2(lzw);
         let mut decoded = Vec::new();
-        rle.read_to_end(&mut decoded)?;
+        match self.crunch_type {
+            0xfe => {
+                let lzw = CrunchCpmReader::new(comp, self.old)?;
+                Rle90Reader::new_type2(lzw).read_to_end(&mut decoded)?;
+            }
+            // LZHUF emits final bytes directly; there is no RLE90 stage.
+            _ => {
+                CrunchLzhufReader::new(comp, self.old)?.read_to_end(&mut decoded)?;
+            }
+        }
 
         if self.haschecksum {
             let sum: u32 = decoded.iter().map(|&b| u32::from(b)).sum();
@@ -710,11 +976,15 @@ mod tests {
     }
 
     #[test]
-    fn lzhuf_type_is_recognized_but_unsupported() {
+    fn lzhuf_type_is_recognized_and_decoded() {
+        // 0xfd is now decoded (see crunch_lzhuf_oracle.rs for the codec tests).
+        // Here we only confirm the container routes 0xfd to the LZHUF decoder:
+        // recognition and naming hold, and a garbage body fails while *decoding*
+        // (InvalidData), not as an unsupported type.
         let data = container(0xfd, b"AB.TXT", 0x20, 1, AB_BODY, None);
         assert!(CrunchArchive::recognize(&data));
         let arc = CrunchArchive::open(&data[..]).unwrap();
         assert_eq!(arc.entries()[0].compression_name(), "LZHUF 2.0");
-        assert_eq!(read0(&arc).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(read0(&arc).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -162,6 +162,46 @@ fn ours(data: &[u8]) -> BTreeMap<String, Vec<u8>> {
     map
 }
 
+/// A complete standalone Crunch (LZW, type 0xfe) file whose body decodes to
+/// "AB" (the hand-built stream from the crunch_cpm tests), with `name` as its
+/// internal name and no trailing checksum.
+fn crunch_ab(name: &str) -> Vec<u8> {
+    let mut v = vec![0x76, 0xfe];
+    v.extend_from_slice(name.as_bytes());
+    v.push(0);
+    v.push(0x20); // version1
+    v.push(0x20); // version2 → new variant
+    v.push(0x01); // errordetection != 0 → no checksum
+    v.push(0x00); // reserved
+    v.extend_from_slice(&[0x20, 0x90, 0xA0, 0x00]); // LZW body → "AB"
+    v
+}
+
+#[test]
+fn crunched_member_matches_unar() {
+    if !unar_installed() {
+        eprintln!("skipping: `unar` not installed");
+        return;
+    }
+
+    let stored = b"plain stored neighbour\n".to_vec();
+    // Extension's 2nd char 'Z' marks Crunch; the embedded 0x76 0xfe confirms it.
+    let lbr = build_lbr(&[
+        member("PLAIN", "TXT", stored.clone()),
+        member("CRUNCHED", "AZT", crunch_ab("abc.txt")),
+    ]);
+
+    let mine = ours(&lbr);
+    assert_eq!(mine.get("PLAIN.TXT"), Some(&stored));
+    assert_eq!(mine.get("abc.txt"), Some(&b"AB".to_vec())); // internal crunch name
+
+    assert_eq!(
+        mine,
+        unar_extract_all(&lbr, "test.lbr"),
+        "our LBR crunch extraction disagrees with unar"
+    );
+}
+
 #[test]
 fn stored_and_squeezed_members_match_unar() {
     if !unar_installed() {

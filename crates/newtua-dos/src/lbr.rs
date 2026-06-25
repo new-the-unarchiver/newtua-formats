@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 
 use newtua_common::crc16::{crc16_ccitt, update_ccitt};
 
+use crate::crunch_cpm::CrunchArchive;
 use crate::squeeze::SqueezeFile;
 
 const SECTOR: usize = 128;
@@ -142,8 +143,8 @@ impl LbrArchive {
     /// Decode member `idx` and write it to `out`.
     ///
     /// Stored members are copied verbatim and their CP/M CRC-16 is verified;
-    /// Squeezed members are decoded (and verify their own internal checksum).
-    /// Crunched members are unsupported (see [`Member::Crunched`]).
+    /// Squeezed members are decoded (and verify their own internal checksum);
+    /// Crunched members are decoded as embedded standalone Crunch files.
     pub fn read_entry(&self, idx: usize, out: &mut dyn Write) -> io::Result<()> {
         let e = self
             .entries
@@ -164,10 +165,11 @@ impl LbrArchive {
                 let decoded = SqueezeFile::open(body)?.decode()?;
                 out.write_all(&decoded)
             }
-            Member::Crunched => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "lbr: standalone Crunch members are not yet supported (roadmap item)",
-            )),
+            Member::Crunched => {
+                // The member body is a complete standalone Crunch (CP/M LZW or
+                // CrLZH) file; decode it through the crunch_cpm container.
+                CrunchArchive::open(body)?.read_entry(0, out)
+            }
         }
     }
 }
@@ -492,14 +494,19 @@ mod tests {
     }
 
     #[test]
-    fn crunched_member_is_listed_but_unsupported() {
-        // Minimal standalone Crunch header: magic 0x76 0xfe, internal name, NUL.
-        let crunch = b"\x76\xfe\x66\x6f\x6f\x00rest";
+    fn crunched_member_uses_internal_name_and_decodes() {
+        // A complete standalone Crunch (LZW, type 0xfe) file with internal name
+        // "foo": magic, type, name, NUL, version1/version2 (0x20 → new variant),
+        // errordetection 1 (no checksum), reserved, then the hand-built LZW body
+        // that decodes to "AB" (see crunch_cpm.rs tests).
+        let crunch: &[u8] = &[
+            0x76, 0xfe, b'f', b'o', b'o', 0x00, 0x20, 0x20, 0x01, 0x00, // header
+            0x20, 0x90, 0xA0, 0x00, // LZW body → "AB"
+        ];
         let lbr = build_lbr(&[m("FOO", "AZT", crunch)]);
         let arc = LbrArchive::open(&lbr[..]).unwrap();
         assert_eq!(arc.entries()[0].name(), b"foo"); // internal crunch name
-        let err = read(&arc, 0).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(read(&arc, 0).unwrap(), b"AB");
     }
 
     #[test]
