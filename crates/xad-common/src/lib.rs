@@ -9,3 +9,5 @@
 //! Modules are grown test-first as the format crates need them.
 
 #![forbid(unsafe_code)]
+
+pub mod rle90;
