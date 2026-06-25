@@ -21,9 +21,12 @@ is usable standalone by the wider community.
 
 ## Architecture
 
-- `crates/newtua-common` — shared primitives reused by every family crate: bit
-  readers, prefix/Huffman codes, LZSS sliding window, range coder, CRC, RLE90.
-  Grown **test-first**, one primitive at a time, as formats need them.
+- `crates/newtua-common` — shared primitives reused by every family crate, grown
+  **test-first** as formats need them. Currently: `bitreader` (LSB- and MSB-first
+  bit readers), `prefixcode` (Huffman/prefix tree, incremental or table build),
+  `lzss` (`LzssWindow` sliding window), `compress` (Unix-`compress` LZW),
+  `rle90` (RLE90 run expansion), `crc16` (CRC-16/ARC and CRC-16/CCITT-XMODEM),
+  `bytes` (little-endian helpers). Reuse these before writing a new codec.
 - `crates/newtua-dos` (and future `newtua-mac`, `newtua-stuffit`, `newtua-amiga`, `newtua-alz`,
   `newtua-nsis`) — one crate per **family**; each format inside is a container parser
   + its compression methods.
