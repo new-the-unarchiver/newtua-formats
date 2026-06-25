@@ -8,3 +8,5 @@
 //! Modules are added one format at a time, test-first.
 
 #![forbid(unsafe_code)]
+
+pub mod squeeze;
