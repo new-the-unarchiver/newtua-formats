@@ -6,9 +6,9 @@
 //! subdirectory and `0x1F`/`0x80` close one.
 //!
 //! Supported methods so far: 1/2 stored, 3 packed (RLE90), 4 squeezed
-//! (Huffman + RLE90), 8 crunched-LZW (compress + RLE90), 9 squashed (compress),
-//! 0x7f compressed (compress). Crunch (5/6/7), crushed (0xa) and distilled
-//! (0xb) return `Unsupported` pending their codecs.
+//! (Huffman + RLE90), 5/6/7 crunched (hash LZW, ±RLE90), 8 crunched-LZW
+//! (compress + RLE90), 9 squashed (compress), 0x7f compressed (compress).
+//! Crushed (0xa) and distilled (0xb) return `Unsupported` pending their codecs.
 
 use std::io::{self, Read, Write};
 
@@ -16,6 +16,7 @@ use newtua_common::compress::CompressReader;
 use newtua_common::crc16::crc16_arc;
 use newtua_common::rle90::Rle90Reader;
 
+use crate::crunch::{CrunchHash, CrunchReader};
 use crate::squeeze::SqueezeReader;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
@@ -229,6 +230,21 @@ fn decode_method(method: u8, comp: &[u8], uncompressed_size: usize) -> io::Resul
             let huffman = SqueezeReader::new(comp)?;
             read_n(Rle90Reader::new(huffman), uncompressed_size)
         }
+        // Crunched (no packing): 12-bit hash LZW, no RLE90.
+        5 => read_n(
+            CrunchReader::new(comp, CrunchHash::Quadratic),
+            uncompressed_size,
+        ),
+        // Crunched: 12-bit hash LZW (quadratic hash), then RLE90.
+        6 => read_n(
+            Rle90Reader::new(CrunchReader::new(comp, CrunchHash::Quadratic)),
+            uncompressed_size,
+        ),
+        // Crunched (fast): 12-bit hash LZW (multiplicative hash), then RLE90.
+        7 => read_n(
+            Rle90Reader::new(CrunchReader::new(comp, CrunchHash::Multiplicative)),
+            uncompressed_size,
+        ),
         // Crunched (LZW): a leading 0x0c byte, then 12-bit compress, then RLE90.
         8 => {
             let body = comp
@@ -259,6 +275,7 @@ fn decode_method(method: u8, comp: &[u8], uncompressed_size: usize) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testhex::hex;
 
     /// Build a stored (method 2) member.
     fn stored(name: &[u8], content: &[u8]) -> Vec<u8> {
@@ -399,17 +416,5 @@ mod tests {
         let a = archive(&[member(0x0b, b"c", b"....", b"....")]);
         let arc = ArcArchive::open(&a[..]).unwrap();
         assert!(read(&arc, 0).is_err());
-    }
-
-    /// Decode an ASCII-hex string into bytes (test helper).
-    fn hex(s: &[u8]) -> Vec<u8> {
-        fn nib(c: u8) -> u8 {
-            match c {
-                b'0'..=b'9' => c - b'0',
-                b'a'..=b'f' => c - b'a' + 10,
-                _ => panic!("bad hex"),
-            }
-        }
-        s.chunks(2).map(|p| nib(p[0]) << 4 | nib(p[1])).collect()
     }
 }

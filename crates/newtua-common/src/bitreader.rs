@@ -1,7 +1,8 @@
-//! LSB-first bit reader.
+//! Bit readers.
 //!
-//! Bits are consumed from the least-significant end of each byte first. Used by
-//! formats whose bit-packed data is little-endian (e.g. Squeeze).
+//! [`BitReaderLsb`] consumes bits from the least-significant end of each byte
+//! first (formats whose bit-packed data is little-endian, e.g. Squeeze).
+//! [`BitReaderMsb`] consumes them most-significant first (e.g. ARC Crunch).
 
 use std::io::{self, Read};
 
@@ -42,6 +43,45 @@ impl<R: Read> BitReaderLsb<R> {
         self.byte >>= 1;
         self.nbits -= 1;
         Ok(Some(bit))
+    }
+}
+
+/// Reads fixed- or variable-width codes from an inner byte reader,
+/// most-significant bit first (big-endian bit order).
+pub struct BitReaderMsb<R> {
+    inner: R,
+    acc: u32,
+    nbits: u8,
+}
+
+impl<R: Read> BitReaderMsb<R> {
+    /// Wrap `inner`, reading its bytes as an MSB-first bit stream.
+    ///
+    /// As with [`BitReaderLsb`], bits are refilled one byte at a time; wrap an
+    /// unbuffered source in a `BufReader` to avoid per-byte reads.
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            acc: 0,
+            nbits: 0,
+        }
+    }
+
+    /// Read the next `n`-bit code (`n` ≤ 24), most-significant bit first.
+    /// Returns `None` once fewer than `n` bits remain.
+    pub fn read(&mut self, n: u8) -> io::Result<Option<u32>> {
+        while self.nbits < n {
+            match crate::read_one_byte(&mut self.inner)? {
+                Some(b) => {
+                    self.acc = (self.acc << 8) | u32::from(b);
+                    self.nbits += 8;
+                }
+                None => return Ok(None),
+            }
+        }
+        self.nbits -= n;
+        let mask = (1u32 << n) - 1;
+        Ok(Some((self.acc >> self.nbits) & mask))
     }
 }
 
@@ -140,5 +180,30 @@ mod tests {
         let mut expect = vec![false; 8];
         expect[0] = true;
         assert_eq!(bits, expect);
+    }
+
+    #[test]
+    fn msb_reads_twelve_bit_codes() {
+        // 0xAB 0xCD 0xEF → top 12 bits = 0xABC, next 12 = 0xDEF.
+        let mut r = BitReaderMsb::new(Cursor::new(vec![0xAB, 0xCD, 0xEF]));
+        assert_eq!(r.read(12).unwrap(), Some(0xABC));
+        assert_eq!(r.read(12).unwrap(), Some(0xDEF));
+        assert_eq!(r.read(12).unwrap(), None);
+    }
+
+    #[test]
+    fn msb_reads_mixed_widths() {
+        // 0xAB 0xCD → 4 bits = 0xA, 8 bits = 0xBC, 4 bits = 0xD.
+        let mut r = BitReaderMsb::new(Cursor::new(vec![0xAB, 0xCD]));
+        assert_eq!(r.read(4).unwrap(), Some(0xA));
+        assert_eq!(r.read(8).unwrap(), Some(0xBC));
+        assert_eq!(r.read(4).unwrap(), Some(0xD));
+        assert_eq!(r.read(4).unwrap(), None);
+    }
+
+    #[test]
+    fn msb_empty_input_is_none() {
+        let mut r = BitReaderMsb::new(Cursor::new(Vec::new()));
+        assert_eq!(r.read(12).unwrap(), None);
     }
 }

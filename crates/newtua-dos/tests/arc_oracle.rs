@@ -62,6 +62,13 @@ fn compressed_method_matches_unar() {
     assert_matches_unar("cmp.arc");
 }
 
+/// `crunch.arc` holds a stored anchor plus method-5 (no RLE90), method-6
+/// (quadratic hash + RLE90) and method-7 (multiplicative hash + RLE90) members.
+#[test]
+fn crunch_methods_match_unar() {
+    assert_matches_unar("crunch.arc");
+}
+
 /// `clear.arc` is a method-0x7f member at maxbits 9 whose ~800-byte payload
 /// fills the table twice, forcing two block-mode clear codes (and their
 /// group-of-8 padding) — the one compress path the smaller fixtures never hit.
