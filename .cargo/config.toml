@@ -9,9 +9,19 @@
 #   cargo tw   → whole workspace (the final Definition-of-Done sweep)
 #
 # Append any nextest flags as usual, e.g. `cargo td decode_one` to filter.
+#
+# While only fixing compile errors (not yet ready to RUN a test), use the
+# check-only aliases: they type-check the crate and SKIP codegen + linking, so
+# they finish far faster than building a test binary. Switch to `cargo td` only
+# when you actually need to observe a test go red/green.
+#
+#   cargo kc / kd / ka   → clippy on common / dos / amiga (compile check only)
 [alias]
 tc = "nextest run -p newtua-common"
 td = "nextest run -p newtua-dos"
 ta = "nextest run -p newtua-amiga"
 tu = "nextest run -p newtua-testutil"
 tw = "nextest run --workspace"
+kc = "clippy -p newtua-common --all-targets"
+kd = "clippy -p newtua-dos --all-targets"
+ka = "clippy -p newtua-amiga --all-targets"

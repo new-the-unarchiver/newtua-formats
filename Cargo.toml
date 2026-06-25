@@ -24,5 +24,10 @@ newtua-testutil = { path = "crates/newtua-testutil" }
 # Keep line tables (so panics and test failures still point at a source line)
 # but drop full debug info — faster builds and a smaller target/ during the
 # tight TDD loop, where we never run a debugger anyway.
+#
+# `split-debuginfo = "unpacked"` skips the macOS `dsymutil` step on every link.
+# With no external dependencies, linking dominates the incremental rebuild, so
+# dropping dsymutil is the single biggest per-iteration win here.
 [profile.dev]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
