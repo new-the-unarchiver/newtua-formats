@@ -1,7 +1,9 @@
 //! RLE90 run-length decoding.
 //!
 //! The `0x90` byte is a repeat marker: `b 0x90 n` expands to `b` repeated `n`
-//! times total. `0x90 0x00` is a literal `0x90`. A count of `1` is invalid.
+//! times total. `0x90 0x00` is a literal `0x90`. In the plain variant a count
+//! of `1` is invalid; in the "type 2" variant used by CP/M Crunch a count of
+//! `1` is a second spelling of the literal `0x90` (`xx 90 01` → `xx 90`).
 
 use std::io::{self, Read};
 
@@ -10,15 +12,28 @@ pub struct Rle90Reader<R> {
     inner: R,
     repeated: u8,
     count: usize,
+    type2: bool,
 }
 
 impl<R: Read> Rle90Reader<R> {
-    /// Wrap `inner`, decoding its bytes as an RLE90 stream.
+    /// Wrap `inner`, decoding its bytes as a plain RLE90 stream.
     pub fn new(inner: R) -> Self {
+        Self::with_type2(inner, false)
+    }
+
+    /// Wrap `inner`, decoding its bytes as a "type 2" RLE90 stream, where a
+    /// repeat count of `1` is a literal `0x90` rather than an error. Used by
+    /// CP/M Crunch.
+    pub fn new_type2(inner: R) -> Self {
+        Self::with_type2(inner, true)
+    }
+
+    fn with_type2(inner: R, type2: bool) -> Self {
         Self {
             inner,
             repeated: 0,
             count: 0,
+            type2,
         }
     }
 }
@@ -63,8 +78,12 @@ impl<R: Read> Rle90Reader<R> {
         })?;
 
         match count {
-            // 0x90 0x00 is a literal 0x90.
+            // 0x90 0x00 is a literal 0x90; in type 2, so is 0x90 0x01.
             0 => {
+                self.repeated = 0x90;
+                Ok(Some(0x90))
+            }
+            1 if self.type2 => {
                 self.repeated = 0x90;
                 Ok(Some(0x90))
             }
@@ -131,5 +150,42 @@ mod tests {
         // repeated byte (0x00) — the marker's implied "first copy" is the
         // absent literal.
         assert_eq!(decode(&[0x90, 0x03]).unwrap(), vec![0x00; 2]);
+    }
+
+    fn decode_type2(input: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        Rle90Reader::new_type2(Cursor::new(input.to_vec())).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn type2_count_of_one_is_literal_marker() {
+        // The only difference from plain RLE90: `xx 90 01` decodes to `xx 90`,
+        // where plain RLE90 rejects a count of 1.
+        assert_eq!(decode_type2(&[0x41, 0x90, 0x01]).unwrap(), vec![0x41, 0x90]);
+    }
+
+    #[test]
+    fn type2_count_of_zero_is_still_literal_marker() {
+        assert_eq!(decode_type2(&[0x90, 0x00]).unwrap(), vec![0x90]);
+    }
+
+    #[test]
+    fn type2_run_of_two_or_more_repeats_previous_byte() {
+        assert_eq!(decode_type2(&[0x41, 0x90, 0x03]).unwrap(), vec![0x41; 3]);
+    }
+
+    #[test]
+    fn type2_run_after_literal_marker_repeats_0x90() {
+        // 0x90 0x01 (literal 0x90), then 0x90 0x03 → three 0x90 total.
+        assert_eq!(
+            decode_type2(&[0x90, 0x01, 0x90, 0x03]).unwrap(),
+            vec![0x90; 3]
+        );
+    }
+
+    #[test]
+    fn plain_variant_still_rejects_count_of_one() {
+        assert!(decode(&[0x41, 0x90, 0x01]).is_err());
     }
 }

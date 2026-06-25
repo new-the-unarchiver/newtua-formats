@@ -11,6 +11,7 @@
 
 pub mod arc;
 pub mod crunch;
+pub mod crunch_cpm;
 pub mod crush;
 pub mod distill;
 pub mod lbr;
