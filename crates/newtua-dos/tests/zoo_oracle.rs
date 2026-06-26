@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use newtua_common::crc16::crc16_arc;
 use newtua_dos::zoo::ZooArchive;
-use newtua_testutil::{unar_extract_all, unar_installed};
+use newtua_testutil::{unar_extract_all, unar_installed, BitWriter};
 
 const MAGIC: [u8; 4] = [0xdc, 0xa7, 0xc4, 0xfd];
 
@@ -242,6 +242,56 @@ fn simulate(tokens: &[Tok]) -> Vec<u8> {
     out
 }
 
+// --- mirror LZW (method 1) encoder --------------------------------------------
+
+/// Greedy LZW parse of `input` into a Zoo method-1 bitstream, mirroring the
+/// generic LZW table growth: codes from 258, symbol width tracking the
+/// decoder's lagging `numsymbols`, terminated with the EOF code 257.
+fn lzw_encode(input: &[u8]) -> Vec<u8> {
+    use std::collections::HashMap;
+    const MAXSYMBOLS: i32 = 8192;
+
+    let mut dict: HashMap<Vec<u8>, i32> = HashMap::new();
+    for b in 0..256 {
+        dict.insert(vec![b as u8], b);
+    }
+    let mut next_code = 258i32;
+    let mut codes = Vec::new();
+    if !input.is_empty() {
+        let mut w = vec![input[0]];
+        for &c in &input[1..] {
+            let mut wc = w.clone();
+            wc.push(c);
+            if dict.contains_key(&wc) {
+                w = wc;
+            } else {
+                codes.push(dict[&w]);
+                if next_code < MAXSYMBOLS {
+                    dict.insert(wc, next_code);
+                    next_code += 1;
+                }
+                w = vec![c];
+            }
+        }
+        codes.push(dict[&w]);
+    }
+
+    let mut w = BitWriter::default();
+    let mut numsymbols = 258i32;
+    let mut symbolsize = 9u32;
+    for (i, &code) in codes.iter().enumerate() {
+        w.bits(code as u32, symbolsize);
+        if i >= 1 && numsymbols < MAXSYMBOLS {
+            numsymbols += 1;
+            if numsymbols != MAXSYMBOLS && (numsymbols & (numsymbols - 1)) == 0 {
+                symbolsize += 1;
+            }
+        }
+    }
+    w.bits(257, symbolsize); // EOF marker
+    w.finish()
+}
+
 // --- container builder (type-0, short-named members) --------------------------
 
 struct Member {
@@ -270,6 +320,16 @@ fn lzh(name: &'static str, tokens: &[Tok]) -> Member {
         uncompsize: out.len() as u32,
         crc16: crc16_arc(&out),
         data: encode_lzh(tokens),
+    }
+}
+
+fn lzw(name: &'static str, content: &[u8]) -> Member {
+    Member {
+        name,
+        method: 1,
+        uncompsize: content.len() as u32,
+        crc16: crc16_arc(content),
+        data: lzw_encode(content),
     }
 }
 
@@ -362,10 +422,25 @@ fn stored_and_lzh_members_match_unar() {
     let text = b"the quick brown fox jumps over the lazy dog";
     let text_tokens: Vec<Tok> = text.iter().map(|&b| Tok::Lit(b)).collect();
 
+    // LZW (method 1) members: repeats (back-references), a single-byte run that
+    // drives the KwKwK case, and a long varied input that pushes the symbol
+    // width past 9 bits.
+    let lzw_repeat = b"TOBEORNOTTOBEORTOBEORNOT#TOBEORNOT".to_vec();
+    let lzw_run = vec![b'A'; 64];
+    let mut lzw_big = Vec::new();
+    for i in 0..2000u32 {
+        lzw_big.push((i & 0xff) as u8);
+        lzw_big.push(((i >> 8) & 0xff) as u8);
+        lzw_big.push((i.wrapping_mul(31) & 0xff) as u8);
+    }
+
     let zoo = build_zoo(&[
         stored("stored.txt", b"Zoo stored member, verbatim.\n"),
         lzh("mix.bin", &mix),
         lzh("text.bin", &text_tokens),
+        lzw("lzwrep.bin", &lzw_repeat),
+        lzw("lzwrun.bin", &lzw_run),
+        lzw("lzwbig.bin", &lzw_big),
     ]);
 
     let mine = ours(&zoo);
@@ -375,6 +450,9 @@ fn stored_and_lzh_members_match_unar() {
     );
     assert_eq!(mine.get("mix.bin").unwrap(), &simulate(&mix));
     assert_eq!(mine.get("text.bin").unwrap(), text);
+    assert_eq!(mine.get("lzwrep.bin").unwrap(), &lzw_repeat);
+    assert_eq!(mine.get("lzwrun.bin").unwrap(), &lzw_run);
+    assert_eq!(mine.get("lzwbig.bin").unwrap(), &lzw_big);
 
     if !unar_installed() {
         eprintln!("skipping unar cross-check: `unar` not installed");

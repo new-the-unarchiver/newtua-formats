@@ -7,17 +7,18 @@
 //! with one of two methods: LZW (method 1) or LZH-static (method 2). Decoded
 //! contents are checked against a per-entry CRC-16/ARC.
 //!
-//! This module covers the container, stored members, and method 2 (LZH-static).
-//! Method 1 (Zoo's LZW) is a separate roadmap item and is reported as
-//! `Unsupported`.
+//! This module covers the container and all of Zoo's methods: stored, LZW
+//! (method 1), and LZH-static (method 2).
 //!
-//! Faithful port of XADMaster's `XADZooParser.m` and `XADLZHStaticHandle.m`.
+//! Faithful port of XADMaster's `XADZooParser.m`, `LZW.c`, and
+//! `XADLZHStaticHandle.m`.
 
 use std::io::{self, Read, Write};
 
-use newtua_common::bitreader::BitReaderMsb;
+use newtua_common::bitreader::{BitReaderLsb, BitReaderMsb};
 use newtua_common::crc16::crc16_arc;
 use newtua_common::lzss::LzssWindow;
+use newtua_common::lzw::{Lzw, LzwError};
 use newtua_common::prefixcode::PrefixCode;
 
 /// Magic at file offset 0x14 and at the start of every directory entry.
@@ -149,7 +150,11 @@ impl ZooArchive {
                 LzhStaticReader::new(comp, WINDOW_BITS).read_exact(&mut buf)?;
                 buf
             }
-            1 => return Err(unsupported("zoo: LZW (method 1) is not supported")),
+            1 => {
+                let mut buf = vec![0u8; e.uncompsize];
+                ZooLzwReader::new(comp).read_exact(&mut buf)?;
+                buf
+            }
             other => return Err(unsupported(format!("zoo: unsupported method {other}"))),
         };
 
@@ -461,9 +466,79 @@ impl<R: Read> Read for LzhStaticReader<R> {
     }
 }
 
+/// LZW decoder (Zoo method 1): variable-width codes (9–13 bits, LSB-first) over
+/// a generic LZW code tree. Code 256 clears the table, 257 ends the stream.
+///
+/// Faithful port of `XADZooMethod1Handle`.
+struct ZooLzwReader<R> {
+    bits: BitReaderLsb<R>,
+    lzw: Lzw,
+    buffer: Vec<u8>,
+    currbyte: usize,
+    finished: bool,
+}
+
+impl<R: Read> ZooLzwReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            bits: BitReaderLsb::new(inner),
+            lzw: Lzw::new(8192, 2),
+            buffer: Vec::new(),
+            currbyte: 0,
+            finished: false,
+        }
+    }
+
+    /// Produce the next decoded byte, or `None` at end of stream (the EOF code
+    /// or exhausted input). Mirrors `produceByteAtOffset`: the buffer holds one
+    /// symbol's bytes leaf-first, drained back-to-front.
+    fn next_byte(&mut self) -> io::Result<Option<u8>> {
+        if self.currbyte == 0 {
+            let symbol = loop {
+                let size = self.lzw.suggested_symbol_size() as u8;
+                let symbol = match self.bits.read_bits(size)? {
+                    Some(s) => s as i32,
+                    None => return Ok(None),
+                };
+                if symbol == 256 {
+                    self.lzw.clear_table();
+                } else if symbol == 257 {
+                    return Ok(None);
+                } else {
+                    break symbol;
+                }
+            };
+            match self.lzw.next_symbol(symbol) {
+                Ok(()) | Err(LzwError::TooManyCodes) => {}
+                Err(LzwError::InvalidCode) => return Err(invalid("zoo: invalid LZW code")),
+            }
+            self.currbyte = self.lzw.reverse_output_to_buffer(&mut self.buffer);
+        }
+        self.currbyte -= 1;
+        Ok(Some(self.buffer[self.currbyte]))
+    }
+}
+
+impl<R: Read> Read for ZooLzwReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let mut n = 0;
+        while n < out.len() && !self.finished {
+            match self.next_byte()? {
+                Some(b) => {
+                    out[n] = b;
+                    n += 1;
+                }
+                None => self.finished = true,
+            }
+        }
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use newtua_testutil::BitWriter;
 
     const MAGIC_BYTES: [u8; 4] = [0xdc, 0xa7, 0xc4, 0xfd];
 
@@ -772,14 +847,111 @@ mod tests {
         assert_eq!(read(&arc, 0).unwrap(), expected);
     }
 
-    #[test]
-    fn lzw_method_is_unsupported() {
-        let mut e = E::stored(0, "L.BIN", b"whatever");
+    /// Greedy LZW parse of `input` into a Zoo method-1 bitstream, mirroring the
+    /// decoder's table growth exactly: codes start at 258, the symbol width
+    /// follows the decoder's `numsymbols` (which lags the encoder's own dict by
+    /// one — the first code defines no decoder node), and the stream ends with
+    /// the EOF code 257.
+    fn lzw_encode(input: &[u8]) -> Vec<u8> {
+        use std::collections::HashMap;
+        const MAXSYMBOLS: i32 = 8192;
+
+        let mut dict: HashMap<Vec<u8>, i32> = HashMap::new();
+        for b in 0..256 {
+            dict.insert(vec![b as u8], b);
+        }
+        let mut next_code = 258i32;
+        let mut codes = Vec::new();
+        if !input.is_empty() {
+            let mut w = vec![input[0]];
+            for &c in &input[1..] {
+                let mut wc = w.clone();
+                wc.push(c);
+                if dict.contains_key(&wc) {
+                    w = wc;
+                } else {
+                    codes.push(dict[&w]);
+                    if next_code < MAXSYMBOLS {
+                        dict.insert(wc, next_code);
+                        next_code += 1;
+                    }
+                    w = vec![c];
+                }
+            }
+            codes.push(dict[&w]);
+        }
+
+        let mut w = BitWriter::default();
+        let mut numsymbols = 258i32;
+        let mut symbolsize = 9u32;
+        for (i, &code) in codes.iter().enumerate() {
+            w.bits(code as u32, symbolsize);
+            if i >= 1 && numsymbols < MAXSYMBOLS {
+                numsymbols += 1;
+                if numsymbols != MAXSYMBOLS && (numsymbols & (numsymbols - 1)) == 0 {
+                    symbolsize += 1;
+                }
+            }
+        }
+        w.bits(257, symbolsize); // EOF marker
+        w.finish()
+    }
+
+    /// Build a method-1 (LZW) member around `content` and decode it back.
+    fn lzw_roundtrip(content: &[u8]) -> Vec<u8> {
+        let mut e = E::stored(0, "L.BIN", content);
         e.method = 1;
+        e.data = lzw_encode(content);
         let zoo = build_zoo(&[e]);
         let arc = ZooArchive::open(&zoo[..]).unwrap();
-        let err = read(&arc, 0).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        read(&arc, 0).unwrap()
+    }
+
+    #[test]
+    fn lzw_decodes_literals() {
+        let content = b"ABCDEFGHIJ";
+        assert_eq!(lzw_roundtrip(content), content);
+    }
+
+    #[test]
+    fn lzw_decodes_repeats() {
+        let content = b"TOBEORNOTTOBEORTOBEORNOT";
+        assert_eq!(lzw_roundtrip(content), content);
+    }
+
+    #[test]
+    fn lzw_decodes_kwkwk_runs() {
+        // Runs of one byte are the canonical trigger for the KwKwK case.
+        let content = b"AAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(lzw_roundtrip(content), content);
+    }
+
+    #[test]
+    fn lzw_decodes_across_width_growth() {
+        // A long, varied input adds enough codes to push the symbol width past
+        // 9 bits, exercising the encoder/decoder width handshake.
+        let mut content = Vec::new();
+        for i in 0..2000u32 {
+            content.push((i & 0xff) as u8);
+            content.push(((i >> 8) & 0xff) as u8);
+            content.push((i.wrapping_mul(31) & 0xff) as u8);
+        }
+        assert_eq!(lzw_roundtrip(&content), content);
+    }
+
+    #[test]
+    fn lzw_invalid_code_is_error() {
+        // A single 9-bit code 300 with no prior symbol: 300 >= numsymbols (258).
+        let mut w = BitWriter::default();
+        w.bits(300, 9);
+        let stream = w.finish();
+        let mut e = E::stored(0, "B.BIN", b"unused");
+        e.method = 1;
+        e.uncompsize = 4;
+        e.data = stream;
+        let zoo = build_zoo(&[e]);
+        let arc = ZooArchive::open(&zoo[..]).unwrap();
+        assert!(read(&arc, 0).is_err());
     }
 
     #[test]
