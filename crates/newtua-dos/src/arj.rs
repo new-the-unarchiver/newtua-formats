@@ -13,7 +13,9 @@
 
 use std::io::{self, Read, Write};
 
+use newtua_common::bitreader::BitReaderMsb;
 use newtua_common::crc32::crc32_ieee;
+use newtua_common::lzss::LzssWindow;
 
 use crate::lzh_static::LzhStaticReader;
 
@@ -123,7 +125,11 @@ impl ArjArchive {
                 LzhStaticReader::new(comp, WINDOW_BITS).read_exact(&mut buf)?;
                 buf
             }
-            4 => return Err(unsupported("arj: method 4 (Fastest) — task 8b")),
+            4 => {
+                let mut buf = vec![0u8; e.size];
+                ArjFastestReader::new(comp).read_exact(&mut buf)?;
+                buf
+            }
             other => return Err(unsupported(format!("arj: unsupported method {other}"))),
         };
 
@@ -276,6 +282,107 @@ fn parse(data: &[u8]) -> io::Result<Vec<ArjEntry>> {
     }
 
     Ok(entries)
+}
+
+/// ARJ method 4 ("Fastest"): an LZSS sliding window over a 0x8000-byte window,
+/// fed by an MSB-first bit stream of literal/match tokens. There is no end
+/// marker — decoding simply stops once the caller has drained the member's
+/// declared size. Faithful port of XADMaster's `XADARJFastestHandle`.
+struct ArjFastestReader<R> {
+    bits: BitReaderMsb<R>,
+    window: LzssWindow,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
+    finished: bool,
+}
+
+impl<R: Read> ArjFastestReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            bits: BitReaderMsb::new(inner),
+            window: LzssWindow::new(0x8000),
+            buffer: Vec::new(),
+            buffer_pos: 0,
+            finished: false,
+        }
+    }
+
+    /// Read an `n`-bit field, treating a short read as a truncated stream.
+    fn field(&mut self, n: u8) -> io::Result<u32> {
+        self.bits
+            .read(n)?
+            .ok_or_else(|| invalid("arj: truncated method 4 stream"))
+    }
+
+    /// Decode one token into `buffer`. Returns `false` at a clean end of input
+    /// (no bits left at a token boundary).
+    fn decode_token(&mut self) -> io::Result<bool> {
+        // Length/literal prefix: up to 7 leading one-bits (exponent base 0),
+        // then `pow` suffix bits. `val == 0` selects a literal.
+        let mut val = 0u32;
+        let mut pow = 0u32;
+        while pow < 7 {
+            match self.bits.read(1)? {
+                None => {
+                    return if pow == 0 {
+                        Ok(false) // clean EOF at a token boundary
+                    } else {
+                        Err(invalid("arj: truncated method 4 stream"))
+                    };
+                }
+                Some(0) => break,
+                Some(_) => {
+                    val += 1 << pow;
+                    pow += 1;
+                }
+            }
+        }
+        if pow > 0 {
+            val += self.field(pow as u8)?;
+        }
+
+        if val == 0 {
+            let byte = self.field(8)?;
+            self.window.emit_literal(byte as u8, &mut self.buffer);
+        } else {
+            // Offset prefix: up to 4 leading one-bits over an exponent base of
+            // 9, then `pow` (always >= 9) suffix bits.
+            let mut offs = 0u32;
+            let mut pow = 9u32;
+            while pow < 13 {
+                match self.bits.read(1)? {
+                    None => return Err(invalid("arj: truncated method 4 stream")),
+                    Some(0) => break,
+                    Some(_) => {
+                        offs += 1 << pow;
+                        pow += 1;
+                    }
+                }
+            }
+            offs += self.field(pow as u8)?;
+            let offset = (offs + 1) as usize;
+            let length = (val + 2) as usize;
+            self.window.emit_match(offset, length, &mut self.buffer);
+        }
+        Ok(true)
+    }
+}
+
+impl<R: Read> Read for ArjFastestReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        while self.buffer_pos >= self.buffer.len() && !self.finished {
+            self.buffer.clear();
+            self.buffer_pos = 0;
+            if !self.decode_token()? {
+                self.finished = true;
+            }
+        }
+        let avail = self.buffer.len() - self.buffer_pos;
+        let n = avail.min(out.len());
+        out[..n].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + n]);
+        self.buffer_pos += n;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +643,125 @@ mod tests {
         w.finish()
     }
 
+    // --- method 4 (Fastest) encoder, the inverse of `ArjFastestReader` -------
+
+    /// Emit a literal token for `byte`: the length prefix for `val == 0` (a lone
+    /// 0-bit) followed by the raw 8-bit byte.
+    fn fastest_literal(w: &mut BitW, byte: u8) {
+        w.put(0, 1);
+        w.put(byte as u32, 8);
+    }
+
+    /// Emit the length prefix for a match of `length` (`val = length - 2`):
+    /// `k` leading one-bits (`k = floor(log2(val + 1))`, capped at 7), a 0-bit
+    /// terminator when `k < 7`, then a `k`-bit suffix.
+    fn fastest_len(w: &mut BitW, length: usize) {
+        let val = (length - 2) as u32;
+        let mut k = 0u32;
+        while k < 7 && (1u32 << (k + 1)) - 1 <= val {
+            k += 1;
+        }
+        for _ in 0..k {
+            w.put(1, 1);
+        }
+        if k < 7 {
+            w.put(0, 1);
+        }
+        if k > 0 {
+            w.put(val - ((1u32 << k) - 1), k);
+        }
+    }
+
+    /// Emit the offset prefix for `offset` (`v = offset - 1`): `m` leading
+    /// one-bits over an exponent base of 9 (capped at 4), a 0-bit terminator
+    /// when `m < 4`, then a `(9 + m)`-bit suffix.
+    fn fastest_offset(w: &mut BitW, offset: usize) {
+        let v = (offset - 1) as u32;
+        let mut m = 0u32;
+        while m < 4 {
+            let low = 512 * ((1u32 << m) - 1);
+            if v < low + (1u32 << (9 + m)) {
+                break;
+            }
+            m += 1;
+        }
+        for _ in 0..m {
+            w.put(1, 1);
+        }
+        if m < 4 {
+            w.put(0, 1);
+        }
+        w.put(v - 512 * ((1u32 << m) - 1), 9 + m);
+    }
+
+    /// Emit a full match token: length prefix then offset prefix.
+    fn fastest_match(w: &mut BitW, offset: usize, length: usize) {
+        fastest_len(w, length);
+        fastest_offset(w, offset);
+    }
+
+    /// Decode a hand-built method-4 stream of exactly `size` bytes.
+    fn fastest_decode(stream: &[u8], size: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; size];
+        ArjFastestReader::new(stream).read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    #[test]
+    fn fastest_single_literal() {
+        let mut w = BitW::new();
+        fastest_literal(&mut w, b'A');
+        assert_eq!(fastest_decode(&w.finish(), 1).unwrap(), b"A");
+    }
+
+    #[test]
+    fn fastest_series_of_literals() {
+        let mut w = BitW::new();
+        for &b in b"Hi!" {
+            fastest_literal(&mut w, b);
+        }
+        assert_eq!(fastest_decode(&w.finish(), 3).unwrap(), b"Hi!");
+    }
+
+    #[test]
+    fn fastest_offset_one_run() {
+        // 'x', then a length-4 match at offset 1 replicates it: "xxxxx".
+        let mut w = BitW::new();
+        fastest_literal(&mut w, b'x');
+        fastest_match(&mut w, 1, 4);
+        assert_eq!(fastest_decode(&w.finish(), 5).unwrap(), b"xxxxx");
+    }
+
+    #[test]
+    fn fastest_match_with_offset_suffix() {
+        // "ABCDE", then a length-3 match at offset 5 copies "ABC".
+        let mut w = BitW::new();
+        for &b in b"ABCDE" {
+            fastest_literal(&mut w, b);
+        }
+        fastest_match(&mut w, 5, 3);
+        assert_eq!(fastest_decode(&w.finish(), 8).unwrap(), b"ABCDEABC");
+    }
+
+    #[test]
+    fn fastest_match_with_length_suffix() {
+        // 'q', then a length-10 match at offset 1 yields eleven 'q's.
+        let mut w = BitW::new();
+        fastest_literal(&mut w, b'q');
+        fastest_match(&mut w, 1, 10);
+        assert_eq!(fastest_decode(&w.finish(), 11).unwrap(), vec![b'q'; 11]);
+    }
+
+    #[test]
+    fn fastest_truncated_is_error() {
+        // A literal prefix (one 0-bit) with no byte behind it: the 8-bit read
+        // runs off the end of the input.
+        let mut w = BitW::new();
+        w.put(0, 1);
+        let err = fastest_decode(&w.finish(), 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn extracts_stored_member() {
         let content = b"The quick brown fox jumps over the lazy dog.";
@@ -575,15 +801,18 @@ mod tests {
     }
 
     #[test]
-    fn method_4_is_unsupported() {
-        let mut m = M::stored(b"F.TXT", b"fastest");
-        m.method = 4;
+    fn extracts_method_4_member() {
+        // "abc" as literals, then a length-3 match at offset 3: "abcabc".
+        let decoded = b"abcabc";
+        let mut w = BitW::new();
+        for &b in b"abc" {
+            fastest_literal(&mut w, b);
+        }
+        fastest_match(&mut w, 3, 3);
+        let m = compressed(b"B.TXT", 4, decoded, w.finish());
         let arj = build_arj(&[m]);
         let arc = ArjArchive::open(&arj[..]).unwrap();
-        assert_eq!(
-            read(&arc, 0).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
+        assert_eq!(read(&arc, 0).unwrap(), decoded);
     }
 
     #[test]

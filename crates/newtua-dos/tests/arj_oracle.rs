@@ -1,4 +1,5 @@
-//! End-to-end oracle for the ARJ container and its LZH-static codec.
+//! End-to-end oracle for the ARJ container and its codecs (LZH-static methods
+//! 1/2/3 and the "Fastest" method 4 LZSS).
 //!
 //! No common tool writes `.arj` on this machine (`arj` is absent), so this test
 //! assembles archives from a small builder plus a mirror LZH-static encoder
@@ -227,6 +228,58 @@ fn encode_lzh(tokens: &[Tok]) -> Vec<u8> {
     w.finish()
 }
 
+// --- mirror "Fastest" (method 4) encoder --------------------------------------
+
+/// Encode `tokens` as a method-4 stream, inverting `ArjFastestReader`: each
+/// literal is a single 0-bit plus its byte; each match is an exponent-coded
+/// length prefix (base 0, up to 7 ones) and offset prefix (base 9, up to 4
+/// ones), MSB-first.
+fn encode_fastest(tokens: &[Tok]) -> Vec<u8> {
+    let mut w = BitW::new();
+    for t in tokens {
+        match t {
+            Tok::Lit(b) => {
+                w.put(0, 1); // val = 0 -> literal
+                w.put(*b as u32, 8);
+            }
+            Tok::Match { len, dist } => {
+                let val = (*len - 2) as u32;
+                let mut k = 0u32;
+                while k < 7 && (1u32 << (k + 1)) - 1 <= val {
+                    k += 1;
+                }
+                for _ in 0..k {
+                    w.put(1, 1);
+                }
+                if k < 7 {
+                    w.put(0, 1);
+                }
+                if k > 0 {
+                    w.put(val - ((1u32 << k) - 1), k);
+                }
+
+                let v = (*dist - 1) as u32;
+                let mut m = 0u32;
+                while m < 4 {
+                    let low = 512 * ((1u32 << m) - 1);
+                    if v < low + (1u32 << (9 + m)) {
+                        break;
+                    }
+                    m += 1;
+                }
+                for _ in 0..m {
+                    w.put(1, 1);
+                }
+                if m < 4 {
+                    w.put(0, 1);
+                }
+                w.put(v - 512 * ((1u32 << m) - 1), 9 + m);
+            }
+        }
+    }
+    w.finish()
+}
+
 /// Apply tokens the way the decoder does, to get the expected output bytes.
 fn simulate(tokens: &[Tok]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -267,6 +320,15 @@ fn lzh(name: &'static str, method: u8, tokens: &[Tok]) -> Member {
         method,
         decoded: simulate(tokens),
         data: encode_lzh(tokens),
+    }
+}
+
+fn fastest(name: &'static str, tokens: &[Tok]) -> Member {
+    Member {
+        name,
+        method: 4,
+        decoded: simulate(tokens),
+        data: encode_fastest(tokens),
     }
 }
 
@@ -352,6 +414,7 @@ fn stored_and_lzh_members_match_unar() {
         stored("stored.txt", b"ARJ stored member, verbatim.\n"),
         lzh("mix.bin", 1, &mix),          // method 1 (Most)
         lzh("text.bin", 2, &text_tokens), // method 2 (Medium)
+        fastest("fast.bin", &mix),        // method 4 (Fastest), same token mix
     ]);
 
     let mine = ours(&arj);
@@ -361,6 +424,7 @@ fn stored_and_lzh_members_match_unar() {
     );
     assert_eq!(mine.get("mix.bin").unwrap(), &simulate(&mix));
     assert_eq!(mine.get("text.bin").unwrap(), text);
+    assert_eq!(mine.get("fast.bin").unwrap(), &simulate(&mix));
 
     if !unar_installed() {
         eprintln!("skipping unar cross-check: `unar` not installed");
