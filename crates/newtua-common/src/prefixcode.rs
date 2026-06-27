@@ -188,6 +188,31 @@ impl PrefixCode {
         Ok(Some(self.tree[node][0]))
     }
 
+    /// Decode the next symbol from an arbitrary most-significant-bit-first bit
+    /// source. `read_bit` yields the next bit, or `None` at end of input (then
+    /// this returns `Ok(None)`). Used by decoders that own their bit cursor (and
+    /// need byte-offset bookkeeping the bit readers do not expose), such as
+    /// Compact Pro's LZH. A [`single_symbol`](Self::single_symbol) code returns
+    /// its value at once, consuming nothing.
+    pub fn next_symbol_msb_with(
+        &self,
+        mut read_bit: impl FnMut() -> io::Result<Option<bool>>,
+    ) -> io::Result<Option<i32>> {
+        let mut node = 0usize;
+        while !self.is_leaf(node) {
+            let bit = match read_bit()? {
+                Some(b) => b as usize,
+                None => return Ok(None),
+            };
+            let next = self.tree[node][bit];
+            if next < 0 {
+                return Err(invalid("prefix code: invalid code in bitstream"));
+            }
+            node = next as usize;
+        }
+        Ok(Some(self.tree[node][0]))
+    }
+
     /// Decode the next symbol, reading bits most-significant-first from `bits`.
     /// `Ok(None)` if the bitstream ends before a leaf is reached. A
     /// [`single_symbol`](Self::single_symbol) code returns its value at once,
@@ -336,5 +361,31 @@ mod tests {
         let code = PrefixCode::from_lengths(&[1, 1], 16, true);
         let mut bits = BitReaderMsb::new(Cursor::new(Vec::new()));
         assert_eq!(code.next_symbol_msb(&mut bits).unwrap(), None);
+    }
+
+    #[test]
+    fn next_symbol_msb_with_closure_decodes_canonical_code() {
+        // Same canonical code as `from_lengths_builds_canonical_high_bit_first`:
+        // A=0, B=10, C=110, D=111. Feed the bits A,B,C,D from a Vec via a closure.
+        let code = PrefixCode::from_lengths(&[1, 2, 3, 3], 16, true);
+        let bits = [false, true, false, true, true, false, true, true, true];
+        let mut i = 0;
+        let mut next = || {
+            let b = bits.get(i).copied();
+            i += 1;
+            Ok(b)
+        };
+        let mut out = Vec::new();
+        for _ in 0..4 {
+            out.push(code.next_symbol_msb_with(&mut next).unwrap().unwrap());
+        }
+        assert_eq!(out, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn next_symbol_msb_with_reports_end_of_input() {
+        let code = PrefixCode::from_lengths(&[1, 1], 16, true);
+        let none = || Ok(None);
+        assert_eq!(code.next_symbol_msb_with(none).unwrap(), None);
     }
 }
