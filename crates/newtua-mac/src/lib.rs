@@ -4,7 +4,7 @@
 //! parser plus its codec, built on the shared primitives in [`newtua_common`].
 //!
 //! Formats: BinHex 4.0 (`.hqx`), MacBinary I/II/III, AppleSingle /
-//! AppleDouble, and Compact Pro (`.cpt`).
+//! AppleDouble, Compact Pro (`.cpt`), and PackIt (`.pit`).
 
 #![forbid(unsafe_code)]
 
@@ -12,3 +12,7 @@ pub mod applesingle;
 pub mod binhex;
 pub mod compactpro;
 pub mod macbinary;
+pub mod packit;
+
+pub(crate) mod des;
+pub(crate) mod stuffit_huffman;
