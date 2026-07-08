@@ -63,6 +63,29 @@ fn build_code(lengths: &[u32], max_length: u32) -> io::Result<PrefixCode> {
     PrefixCode::try_from_lengths(lengths, max_length, true)
 }
 
+/// Which deflate dialect the decoder is reading. The variants differ only in
+/// small header details (`XADDeflateHandle.m`): `Nsis` omits the stored-block
+/// length complement and may end at input EOF; `Sitx` reads the dynamic-block
+/// `numdistances` field as six bits instead of five.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    Normal,
+    Nsis,
+    Sitx,
+}
+
+impl Variant {
+    /// Bit width of the dynamic-block `numdistances - 1` field. StuffItX widens
+    /// it to six bits (`XADDeflateHandle.m:132`); everything else uses five.
+    fn numdistances_bits(self) -> u8 {
+        if self == Variant::Sitx {
+            6
+        } else {
+            5
+        }
+    }
+}
+
 /// One decoded block: stored (with a remaining literal-byte count) or Huffman
 /// (with its literal/length and distance codes).
 enum Block {
@@ -87,9 +110,13 @@ fn fixed_distance_code() -> PrefixCode {
 
 /// Parse a dynamic-Huffman block header: the meta code, then the run-length
 /// coded literal and distance code lengths.
-fn parse_dynamic_block(bits: &mut BitReaderLsb<&[u8]>, meta_order: &[u8; 19]) -> io::Result<Block> {
+fn parse_dynamic_block(
+    bits: &mut BitReaderLsb<&[u8]>,
+    meta_order: &[u8; 19],
+    numdistances_bits: u8,
+) -> io::Result<Block> {
     let numliterals = read_bits(bits, 5)? as usize + 257;
-    let numdistances = read_bits(bits, 5)? as usize + 1;
+    let numdistances = read_bits(bits, numdistances_bits)? as usize + 1;
     let nummetas = read_bits(bits, 4)? as usize + 4;
 
     let mut meta_lengths = [0u32; 19];
@@ -167,7 +194,20 @@ fn decode_distance(distance: i32, bits: &mut BitReaderLsb<&[u8]>) -> io::Result<
 }
 
 pub fn inflate(input: &[u8], size: usize, meta_order: &[u8; 19]) -> io::Result<Vec<u8>> {
-    inflate_impl(input, Some(size), meta_order, false)
+    inflate_impl(input, Some(size), meta_order, Variant::Normal)
+}
+
+/// Inflate StuffItX's deflate variant to a known `size`.
+///
+/// A faithful port of `XADDeflateHandle`'s `XADStuffItXDeflateVariant`. It
+/// differs from plain deflate in exactly one way (`XADDeflateHandle.m:132`): the
+/// dynamic-block `numdistances` field is six bits wide instead of five. Stored
+/// blocks still carry (and verify) their length complement, and the stream ends
+/// on the final end-of-block symbol, both as in plain deflate. StuffItX only
+/// ever uses a 32 KiB window (window size 15), which is what the shared core
+/// already assumes.
+pub fn inflate_sitx(input: &[u8], size: usize) -> io::Result<Vec<u8>> {
+    inflate_impl(input, Some(size), &ZIP_ORDER, Variant::Sitx)
 }
 
 /// Inflate NSIS's modified deflate variant, decoding until the stream ends.
@@ -185,7 +225,7 @@ pub fn inflate(input: &[u8], size: usize, meta_order: &[u8; 19]) -> io::Result<V
 /// The uncompressed size is not known ahead of time (NSIS relies on the stream
 /// ending), so the whole stream is decoded into the returned buffer.
 pub fn inflate_nsis(input: &[u8]) -> io::Result<Vec<u8>> {
-    inflate_impl(input, None, &ZIP_ORDER, true)
+    inflate_impl(input, None, &ZIP_ORDER, Variant::Nsis)
 }
 
 /// Read a block header, returning `None` if the input is already exhausted at
@@ -194,7 +234,7 @@ pub fn inflate_nsis(input: &[u8]) -> io::Result<Vec<u8>> {
 fn read_block_header_opt(
     bits: &mut BitReaderLsb<&[u8]>,
     meta_order: &[u8; 19],
-    nsis: bool,
+    variant: Variant,
 ) -> io::Result<Option<(Block, bool)>> {
     let lastblock = match bits.read_bit()? {
         Some(b) => b,
@@ -205,9 +245,9 @@ fn read_block_header_opt(
         0 => {
             bits.align_to_byte();
             let count = read_bits(bits, 16)?;
-            // Plain deflate verifies the complement; NSIS omits it entirely, so
-            // for that variant the two complement bytes are not even present.
-            if !nsis {
+            // Plain deflate (and StuffItX) verify the complement; NSIS omits it
+            // entirely, so for that variant the two bytes are not even present.
+            if variant != Variant::Nsis {
                 let ncount = read_bits(bits, 16)?;
                 if count != (ncount ^ 0xffff) {
                     return Err(invalid("deflate: stored block length check failed"));
@@ -216,7 +256,7 @@ fn read_block_header_opt(
             Block::Stored(count as usize)
         }
         1 => Block::Huffman(fixed_literal_code(), fixed_distance_code()),
-        2 => parse_dynamic_block(bits, meta_order)?,
+        2 => parse_dynamic_block(bits, meta_order, variant.numdistances_bits())?,
         _ => return Err(invalid("deflate: reserved block type")),
     };
     Ok(Some((block, lastblock)))
@@ -229,13 +269,14 @@ fn inflate_impl(
     input: &[u8],
     size: Option<usize>,
     meta_order: &[u8; 19],
-    nsis: bool,
+    variant: Variant,
 ) -> io::Result<Vec<u8>> {
+    let nsis = variant == Variant::Nsis;
     let mut bits = BitReaderLsb::new(input);
     let mut window = LzssWindow::new(WINDOW_SIZE);
     let mut out = Vec::with_capacity(size.unwrap_or(0));
 
-    let (mut block, mut lastblock) = match read_block_header_opt(&mut bits, meta_order, nsis)? {
+    let (mut block, mut lastblock) = match read_block_header_opt(&mut bits, meta_order, variant)? {
         Some(header) => header,
         None if nsis => return Ok(out),
         None => return Err(truncated()),
@@ -287,7 +328,7 @@ fn inflate_impl(
             if lastblock {
                 break;
             }
-            match read_block_header_opt(&mut bits, meta_order, nsis)? {
+            match read_block_header_opt(&mut bits, meta_order, variant)? {
                 Some((b, lb)) => {
                     block = b;
                     lastblock = lb;
@@ -392,6 +433,17 @@ impl LsbWriter {
 }
 
 pub fn deflate_dynamic(data: &[u8], meta_order: &[u8; 19]) -> Vec<u8> {
+    deflate_dynamic_impl(data, meta_order, 5)
+}
+
+/// Like [`deflate_dynamic`], but emits StuffItX's deflate variant: the
+/// `numdistances` header field is six bits wide (`XADDeflateHandle.m:132`). The
+/// matching decoder is [`inflate_sitx`].
+pub fn deflate_dynamic_sitx(data: &[u8], meta_order: &[u8; 19]) -> Vec<u8> {
+    deflate_dynamic_impl(data, meta_order, 6)
+}
+
+fn deflate_dynamic_impl(data: &[u8], meta_order: &[u8; 19], numdistances_bits: u32) -> Vec<u8> {
     // Literal alphabet: every byte that occurs, plus the end-of-block symbol.
     let mut present = [false; 257];
     for &b in data {
@@ -432,7 +484,7 @@ pub fn deflate_dynamic(data: &[u8], meta_order: &[u8; 19]) -> Vec<u8> {
     w.write_bit(1); // lastblock
     w.write_bits(2, 2); // type 2: dynamic Huffman
     w.write_bits(0, 5); // numliterals - 257 = 0  (we always use 257)
-    w.write_bits(0, 5); // numdistances - 1 = 0    (one dummy distance code)
+    w.write_bits(0, numdistances_bits); // numdistances - 1 = 0 (one dummy code)
     w.write_bits(15, 4); // nummetas - 4 = 15       (all 19 written)
     for &sym in meta_order.iter() {
         w.write_bits(meta_lengths[sym as usize], 3);
@@ -613,6 +665,34 @@ mod tests {
     #[test]
     fn nsis_inflate_empty_input_is_empty() {
         assert_eq!(inflate_nsis(&[]).unwrap(), Vec::<u8>::new());
+    }
+
+    // --- StuffItX deflate variant --------------------------------------------
+
+    #[test]
+    fn sitx_inflate_round_trips() {
+        for data in [
+            b"".to_vec(),
+            b"x".to_vec(),
+            b"stuffitx deflate variant, six-bit numdistances field".repeat(10),
+            (0..=255u8).collect(),
+        ] {
+            let comp = deflate_dynamic_sitx(&data, &ZIP_ORDER);
+            assert_eq!(inflate_sitx(&comp, data.len()).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn sitx_stream_misreads_under_plain_inflate() {
+        // A StuffItX stream spends six bits on numdistances where plain deflate
+        // reads only five, so the header desyncs: plain inflate must not
+        // reproduce the data (it errors or yields something else). This is what
+        // makes the six-bit field observable, not an implementation detail.
+        let data = b"the six-bit field shifts every following bit".to_vec();
+        let comp = deflate_dynamic_sitx(&data, &ZIP_ORDER);
+        if let Ok(out) = inflate(&comp, data.len(), &ZIP_ORDER) {
+            assert_ne!(out, data);
+        }
     }
 
     #[test]

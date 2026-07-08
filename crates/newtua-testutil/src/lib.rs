@@ -21,6 +21,20 @@ pub fn unar_installed() -> bool {
         .unwrap_or(false)
 }
 
+/// The directory holding a StuffItX test corpus, or `None` if unset. Oracle
+/// tests that walk a real corpus skip themselves when it is absent. Set
+/// `NEWTUA_SITX_CORPUS` to the `build/` directory of
+/// <https://github.com/ssokolow/stuffit-test-files> (CC0).
+pub fn sitx_corpus_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("NEWTUA_SITX_CORPUS")?;
+    let path = PathBuf::from(dir);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn unique_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
@@ -79,6 +93,36 @@ pub fn unar_extract_all(archive_bytes: &[u8], archive_name: &str) -> BTreeMap<St
     collect(&dir, &dir, &archive, &mut map);
     let _ = fs::remove_dir_all(&dir);
     map
+}
+
+/// Like [`unar_extract_all`], but returns `None` when `unar` itself fails to
+/// parse the archive instead of panicking. Used by corpus oracles to skip
+/// archives the reference decoder cannot handle either (rather than treating
+/// them as our bug).
+pub fn try_unar_extract_all(
+    archive_bytes: &[u8],
+    archive_name: &str,
+) -> Option<BTreeMap<String, Vec<u8>>> {
+    let dir = unique_dir(archive_name);
+    let archive = dir.join(archive_name);
+    fs::write(&archive, archive_bytes).unwrap();
+
+    let status = Command::new("unar")
+        .args(["-quiet", "-force-overwrite", "-no-directory"])
+        .arg("-output-directory")
+        .arg(&dir)
+        .arg(&archive)
+        .status()
+        .expect("run unar");
+    let result = if status.success() {
+        let mut map = BTreeMap::new();
+        collect(&dir, &dir, &archive, &mut map);
+        Some(map)
+    } else {
+        None
+    };
+    let _ = fs::remove_dir_all(&dir);
+    result
 }
 
 /// Extract a **split** (multi-volume) archive with `unar`. The `volumes` are
