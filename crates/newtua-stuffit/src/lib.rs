@@ -9,7 +9,8 @@
 //! Both containers share the same compression methods (store, RLE90, Unix
 //! `compress` / LZW, StuffIt-Huffman, LZAH (method 5), LZ + Huffman (method 13),
 //! and Arsenic (method 15)), dispatched through the shared [`methods`] module.
-//! StuffIt 5 encryption (RC4 + MD5) is parsed but not yet decoded.
+//! StuffIt 5 encrypted members (RC4 + MD5 password) decode via
+//! [`sit5::StuffIt5Archive::open_with_password`].
 
 #![forbid(unsafe_code)]
 

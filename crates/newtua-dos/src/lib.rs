@@ -4,8 +4,8 @@
 //! container parser plus its compression methods, built on the shared
 //! primitives in [`newtua_common`].
 //!
-//! Planned formats (easiest first): Squeeze (`.SQ`), ARC, LBR, Crunch, Zoo, ARJ.
-//! Modules are added one format at a time, test-first.
+//! Formats: Squeeze (`.SQ`), ARC, LBR, Crunch, Zoo, ARJ. Modules are added one
+//! format at a time, test-first.
 
 #![forbid(unsafe_code)]
 

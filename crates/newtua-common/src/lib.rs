@@ -3,7 +3,8 @@
 //!
 //! These are the building blocks reused across the format crates (`newtua-dos`,
 //! `newtua-mac`, `newtua-stuffit`, `newtua-amiga`, …): bit readers, prefix/Huffman
-//! code tables, the LZSS sliding window, RLE90, and CRC variants.
+//! code tables, the LZSS sliding window, LZW, deflate, RLE90, CRC variants, and
+//! the MD5 / RC4 / ZipCrypto crypto primitives.
 //!
 //! Modules are grown test-first as the format crates need them.
 

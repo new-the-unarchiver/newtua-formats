@@ -1,7 +1,7 @@
 [package]
 name = "newtua-mac"
 version = "0.0.0"
-description = "Decoders for classic Macintosh archive/encoding formats: BinHex."
+description = "Decoders for classic Macintosh archive/encoding formats: BinHex, MacBinary/AppleSingle/AppleDouble, Compact Pro, PackIt."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -26,14 +26,17 @@ is usable standalone by the wider community.
   bit readers), `prefixcode` (Huffman/prefix tree, incremental or table build),
   `lzss` (`LzssWindow` sliding window), `lzw` (generic LZW code tree, distinct from
   Unix-compress), `compress` (Unix-`compress` LZW), `stuffit_huffman` (StuffIt's
-  bitstream-embedded Huffman tree), `rle90` (RLE90 run expansion), `crc16`
-  (CRC-16/ARC and CRC-16/CCITT-XMODEM), `crc32` (CRC-32/IEEE, conditioned),
-  `bytes` (little-endian helpers). Reuse these before writing a new codec.
+  bitstream-embedded Huffman tree), `deflate` (RFC 1951 inflate with a
+  parameterisable code-length meta-order), `rle90` (RLE90 run expansion), `crc16`
+  (CRC-16/ARC and CRC-16/CCITT-XMODEM), `crc32` (CRC-32/IEEE conditioned, plus the
+  raw `crc32_step`), `md5` (RFC 1321), `rc4` (RC4 stream cipher), `zipcrypt`
+  (traditional PKWARE ZipCrypto), `bytes` (little-endian helpers). Reuse these
+  before writing a new codec.
 - Family crates — one per **family**, each format inside being a container parser
   plus its compression methods: `newtua-dos` (Squeeze, ARC, LBR, Crunch, Zoo, ARJ),
   `newtua-mac` (BinHex, MacBinary/AppleSingle/AppleDouble, Compact Pro, PackIt),
-  `newtua-stuffit` (StuffIt classic), `newtua-amiga` (PowerPacker), `newtua-alz`
-  (ALZip). `newtua-testutil` holds shared test helpers. Planned but not yet
+  `newtua-stuffit` (StuffIt classic + StuffIt 5), `newtua-amiga` (PowerPacker),
+  `newtua-alz` (ALZip). `newtua-testutil` holds shared test helpers. Planned but not yet
   created: `newtua-nsis`; some family crates still have queued formats (see the
   roadmap). Add a new family crate to the workspace `members` when its first
   format lands.
