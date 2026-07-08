@@ -24,6 +24,7 @@ pub mod prefixcode;
 pub mod rc4;
 pub mod rle90;
 pub mod stuffit_huffman;
+pub mod zipcrypt;
 
 /// Read one byte from `r`, retrying on `Interrupted`; `None` at end of input.
 ///

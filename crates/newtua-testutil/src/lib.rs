@@ -81,6 +81,39 @@ pub fn unar_extract_all(archive_bytes: &[u8], archive_name: &str) -> BTreeMap<St
     map
 }
 
+/// Extract a **split** (multi-volume) archive with `unar`. The `volumes` are
+/// written to a temp dir named `base.alz`, `base.a00`, `base.a01`, … (the scheme
+/// `unar` scans for), then `unar` is run on the first part and its output
+/// collected (path → bytes). Panics if `unar` fails — call only after
+/// [`unar_installed`].
+pub fn unar_extract_all_volumes(volumes: &[&[u8]], base: &str) -> BTreeMap<String, Vec<u8>> {
+    let root = unique_dir(base);
+    let voldir = root.join("vols");
+    let outdir = root.join("out");
+    fs::create_dir_all(&voldir).unwrap();
+    fs::create_dir_all(&outdir).unwrap();
+
+    let first = voldir.join(format!("{base}.alz"));
+    fs::write(&first, volumes[0]).unwrap();
+    for (k, vol) in volumes[1..].iter().enumerate() {
+        fs::write(voldir.join(format!("{base}.a{k:02}")), vol).unwrap();
+    }
+
+    let status = Command::new("unar")
+        .args(["-quiet", "-force-overwrite", "-no-directory"])
+        .arg("-output-directory")
+        .arg(&outdir)
+        .arg(&first)
+        .status()
+        .expect("run unar");
+    assert!(status.success(), "unar failed for split archive {base}.alz");
+
+    let mut map = BTreeMap::new();
+    collect(&outdir, &outdir, &first, &mut map);
+    let _ = fs::remove_dir_all(&root);
+    map
+}
+
 /// A least-significant-bit-first bit writer, used by the test-only encoders
 /// that build fixtures for the LSB-first formats (Squeeze, Distill).
 #[derive(Default)]

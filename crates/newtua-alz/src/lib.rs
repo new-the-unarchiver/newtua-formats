@@ -13,8 +13,10 @@
 //!
 //! Supported compression methods: 0 stored, 1 bzip2, 2 raw deflate, and 3
 //! obfuscated deflate (the same deflate stream, but with the code-length
-//! meta-table read in a size-derived order). Encrypted members and multi-volume
-//! sets are reported as [`io::ErrorKind::Unsupported`].
+//! meta-table read in a size-derived order). Encrypted members (traditional
+//! PKWARE ZipCrypto) decode with a password via [`AlzArchive::open_with_password`];
+//! split archives are assembled from their ordered volumes via
+//! [`AlzArchive::open_volumes`].
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +25,7 @@ use std::io::{self, Read, Write};
 use bzip2_rs::DecoderReader as Bzip2Reader;
 use newtua_common::crc32::crc32_ieee;
 use newtua_common::deflate;
+use newtua_common::zipcrypt;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -93,6 +96,7 @@ impl AlzEntry {
 pub struct AlzArchive {
     data: Vec<u8>,
     entries: Vec<AlzEntry>,
+    password: Option<Vec<u8>>,
 }
 
 impl AlzArchive {
@@ -102,14 +106,51 @@ impl AlzArchive {
     }
 
     /// Read the whole archive from `r` and parse every member record.
-    pub fn open<R: Read>(mut r: R) -> io::Result<Self> {
+    pub fn open<R: Read>(r: R) -> io::Result<Self> {
+        Self::open_inner(r, None)
+    }
+
+    /// Like [`open`](Self::open), but with a password (raw bytes) for encrypted
+    /// members. The catalogue is plaintext, so an incorrect password is not
+    /// detected here — it surfaces from [`read_entry`](Self::read_entry) when an
+    /// encrypted member is decrypted.
+    pub fn open_with_password<R: Read>(r: R, password: &[u8]) -> io::Result<Self> {
+        Self::open_inner(r, Some(password.to_vec()))
+    }
+
+    fn open_inner<R: Read>(mut r: R, password: Option<Vec<u8>>) -> io::Result<Self> {
         let mut data = Vec::new();
         r.read_to_end(&mut data)?;
+        Self::from_data(data, password)
+    }
+
+    /// Open a split archive from its volumes, in order. Volumes are the byte
+    /// buffers of each part; the caller locates them by name (finding them is not
+    /// the library's job). The name scheme, for integration, is
+    /// `^name\.(alz|a[0-9]{2}|b[0-9]{2})$` — the first part ends in `.alz`, the
+    /// continuations in `.a00`, `.a01`, … A single volume behaves like
+    /// [`open`](Self::open).
+    pub fn open_volumes(volumes: &[&[u8]]) -> io::Result<Self> {
+        Self::from_data(splice_volumes(volumes)?, None)
+    }
+
+    /// Like [`open_volumes`](Self::open_volumes), but with a password for
+    /// encrypted members (see [`open_with_password`](Self::open_with_password)).
+    pub fn open_volumes_with_password(volumes: &[&[u8]], password: &[u8]) -> io::Result<Self> {
+        Self::from_data(splice_volumes(volumes)?, Some(password.to_vec()))
+    }
+
+    /// Validate the header and parse every member record from an assembled buffer.
+    fn from_data(data: Vec<u8>, password: Option<Vec<u8>>) -> io::Result<Self> {
         if !Self::recognize(&data) {
             return Err(invalid("alz: not an ALZip archive"));
         }
         let entries = parse(&data)?;
-        Ok(Self { data, entries })
+        Ok(Self {
+            data,
+            entries,
+            password,
+        })
     }
 
     /// The members, in archive order.
@@ -119,9 +160,9 @@ impl AlzArchive {
 
     /// Decode member `idx` and write it to `out`, verifying its CRC-32.
     ///
-    /// Stored (0), bzip2 (1), and raw deflate (2) members are decoded. Obfuscated
-    /// deflate (3), encrypted members, and data that runs past the end of a
-    /// single volume surface as errors.
+    /// Methods 0/1/2/3 are decoded. An encrypted member is first decrypted with
+    /// the archive password; a missing or wrong password is
+    /// [`io::ErrorKind::InvalidInput`].
     pub fn read_entry(&self, idx: usize, out: &mut dyn Write) -> io::Result<()> {
         let e = self
             .entries
@@ -130,12 +171,25 @@ impl AlzArchive {
         if e.is_dir {
             return Err(invalid("alz: entry is a directory"));
         }
-        if e.is_encrypted {
-            return Err(unsupported("alz: encrypted members are not supported"));
-        }
 
-        let comp = &self.data[e.data_offset..e.data_offset + e.compsize];
+        let raw = &self.data[e.data_offset..e.data_offset + e.compsize];
         let size = usize::try_from(e.size).map_err(|_| invalid("alz: size too large"))?;
+
+        // Encrypted members prepend a 12-byte ZipCrypto header; decrypting it
+        // yields the compressed payload, which the method dispatch then decodes.
+        let decrypted;
+        let comp: &[u8] = if e.is_encrypted {
+            let password = self.password.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "alz: password required for encrypted member",
+                )
+            })?;
+            decrypted = zipcrypt::decrypt(raw, password, (e.crc32 >> 24) as u8)?;
+            &decrypted
+        } else {
+            raw
+        };
 
         let decoded = match e.method {
             0 => comp.to_vec(),
@@ -198,6 +252,47 @@ fn parse_number(d: &[u8], p: &mut usize, sizebytes: u8) -> io::Result<u64> {
         v |= u64::from(byte) << (8 * i);
     }
     Ok(v)
+}
+
+/// Join split-archive volumes into one logical stream. At each junction the
+/// reference skips the last 16 bytes of the finished volume and the first 8
+/// bytes of the next one (`addSkipFrom: offs-16 to: offs+8`); the first
+/// volume's 8-byte ALZ header stays and is skipped later by [`parse`]. A single
+/// volume is returned unchanged.
+fn splice_volumes(volumes: &[&[u8]]) -> io::Result<Vec<u8>> {
+    match volumes {
+        [] => Err(invalid("alz: no volumes given")),
+        [only] => Ok(only.to_vec()),
+        [first, middle @ .., last] => {
+            let capacity: usize = volumes.iter().map(|v| v.len()).sum();
+            let mut out = Vec::with_capacity(capacity);
+
+            // First volume: keep all but the 16-byte junction tail.
+            let end = first
+                .len()
+                .checked_sub(16)
+                .ok_or_else(|| invalid("alz: first volume shorter than 16 bytes"))?;
+            out.extend_from_slice(&first[..end]);
+
+            // Middle volumes: drop the 8-byte continuation header and 16-byte tail.
+            for vol in middle {
+                let end = vol
+                    .len()
+                    .checked_sub(16)
+                    .filter(|&e| e >= 8)
+                    .ok_or_else(|| invalid("alz: continuation volume shorter than 24 bytes"))?;
+                out.extend_from_slice(&vol[8..end]);
+            }
+
+            // Final volume: drop only the 8-byte continuation header.
+            let body = last
+                .get(8..)
+                .ok_or_else(|| invalid("alz: final volume shorter than 8 bytes"))?;
+            out.extend_from_slice(body);
+
+            Ok(out)
+        }
+    }
 }
 
 fn parse(data: &[u8]) -> io::Result<Vec<AlzEntry>> {
@@ -580,14 +675,174 @@ mod tests {
         assert!(read(&arc, 0).is_err());
     }
 
+    /// Mirror ZipCrypto encoder: 12-byte check header (last byte = `test_byte`)
+    /// then the encrypted payload. Inverse of `zipcrypt::decrypt`.
+    fn zipcrypt_encrypt(payload: &[u8], password: &[u8], test_byte: u8) -> Vec<u8> {
+        use newtua_common::zipcrypt::ZipCrypt;
+        let mut c = ZipCrypt::new(password);
+        let mut out = Vec::with_capacity(12 + payload.len());
+        for i in 0..12u8 {
+            let p = if i == 11 {
+                test_byte
+            } else {
+                i.wrapping_mul(37)
+            };
+            out.push(p ^ c.keystream_byte());
+            c.update(p);
+        }
+        for &p in payload {
+            out.push(p ^ c.keystream_byte());
+            c.update(p);
+        }
+        out
+    }
+
+    /// An encrypted member: `comp_payload` is the (already compressed) data,
+    /// which we wrap in a ZipCrypto stream keyed by `pw`.
+    fn encrypted_record(
+        name: &[u8],
+        method: u8,
+        content: &[u8],
+        comp_payload: &[u8],
+        pw: &[u8],
+    ) -> Vec<u8> {
+        let crc = crc32_ieee(content);
+        let cipher = zipcrypt_encrypt(comp_payload, pw, (crc >> 24) as u8);
+        // flags: size width 4 (0x40) | encrypted (0x01).
+        record_with_flags(name, 0x41, method, crc, &cipher, content.len() as u64)
+    }
+
+    fn read_with_pw(a: &[u8], idx: usize, pw: &[u8]) -> io::Result<Vec<u8>> {
+        let arc = AlzArchive::open_with_password(a, pw)?;
+        read(&arc, idx)
+    }
+
     #[test]
-    fn encrypted_is_unsupported() {
-        // flags: sizebytes=4 (0x40) | encrypted (0x01).
-        let a = archive(&[record_with_flags(b"e", 0x41, 0, 0, b"data", 4)]);
+    fn decodes_encrypted_stored() {
+        let content = b"encrypted stored member, ZipCrypto keyed.".to_vec();
+        let a = archive(&[encrypted_record(b"e.txt", 0, &content, &content, b"sekret")]);
+        assert_eq!(read_with_pw(&a, 0, b"sekret").unwrap(), content);
+    }
+
+    #[test]
+    fn decodes_encrypted_deflate() {
+        let content = b"encrypted deflate over and over and over. ".repeat(5);
+        let comp = deflate(&content);
+        let a = archive(&[encrypted_record(b"e.bin", 2, &content, &comp, b"pw123")]);
+        assert_eq!(read_with_pw(&a, 0, b"pw123").unwrap(), content);
+    }
+
+    #[test]
+    fn encrypted_wrong_password_errors() {
+        let content = b"wrong password should fail the check byte".to_vec();
+        let a = archive(&[encrypted_record(b"e", 0, &content, &content, b"right")]);
+        let err = read_with_pw(&a, 0, b"wrong").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn encrypted_missing_password_errors() {
+        let content = b"no password given".to_vec();
+        let a = archive(&[encrypted_record(b"e", 0, &content, &content, b"pw")]);
         let arc = AlzArchive::open(&a[..]).unwrap();
         assert!(arc.entries()[0].is_encrypted());
         let err = read(&arc, 0).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn password_ignored_for_unencrypted_member() {
+        let content = b"plain member, password should be ignored";
+        let a = archive(&[file_record(
+            b"p",
+            0,
+            crc32_ieee(content),
+            content,
+            content.len() as u64,
+            4,
+        )]);
+        assert_eq!(read_with_pw(&a, 0, b"whatever").unwrap(), content);
+    }
+
+    /// Cut `full` at the given offsets into volumes, inserting a 16-byte
+    /// junction tail on every non-final volume and an 8-byte continuation header
+    /// on every non-first volume (the framing the reference blindly skips).
+    fn split_into_volumes(full: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
+        let mut bounds = vec![0usize];
+        bounds.extend_from_slice(cuts);
+        bounds.push(full.len());
+        let n = bounds.len() - 1;
+        let mut vols = Vec::new();
+        for k in 0..n {
+            let piece = &full[bounds[k]..bounds[k + 1]];
+            let mut v = Vec::new();
+            if k > 0 {
+                v.extend_from_slice(&[0xEEu8; 8]); // continuation header (skipped)
+            }
+            v.extend_from_slice(piece);
+            if k < n - 1 {
+                v.extend_from_slice(&[0xDDu8; 16]); // junction tail (skipped)
+            }
+            vols.push(v);
+        }
+        vols
+    }
+
+    #[test]
+    fn open_volumes_matches_single_volume() {
+        let d1 = b"first member deflated repeatedly repeatedly. ".repeat(6);
+        let d2 = b"second member, also compressible content here. ".repeat(7);
+        let full = archive(&[
+            file_record(
+                b"a.bin",
+                2,
+                crc32_ieee(&d1),
+                &deflate(&d1),
+                d1.len() as u64,
+                4,
+            ),
+            file_record(
+                b"b.bin",
+                2,
+                crc32_ieee(&d2),
+                &deflate(&d2),
+                d2.len() as u64,
+                4,
+            ),
+        ]);
+        // Cut inside the member data so a member spans a volume junction.
+        let cuts = [full.len() / 3, 2 * full.len() / 3];
+        let vols = split_into_volumes(&full, &cuts);
+        let refs: Vec<&[u8]> = vols.iter().map(|v| v.as_slice()).collect();
+
+        let multi = AlzArchive::open_volumes(&refs).unwrap();
+        let single = AlzArchive::open(&full[..]).unwrap();
+        assert_eq!(multi.entries().len(), single.entries().len());
+        for i in 0..single.entries().len() {
+            assert_eq!(multi.entries()[i].name(), single.entries()[i].name());
+            assert_eq!(read(&multi, i).unwrap(), read(&single, i).unwrap());
+        }
+    }
+
+    #[test]
+    fn open_volumes_single_equals_open() {
+        let content = b"solo volume behaves like open";
+        let full = archive(&[file_record(
+            b"s",
+            0,
+            crc32_ieee(content),
+            content,
+            content.len() as u64,
+            4,
+        )]);
+        let multi = AlzArchive::open_volumes(&[&full[..]]).unwrap();
+        assert_eq!(read(&multi, 0).unwrap(), content);
+    }
+
+    #[test]
+    fn open_volumes_too_short_errors() {
+        // A non-final volume shorter than the 16-byte junction tail is invalid.
+        assert!(AlzArchive::open_volumes(&[&[0u8; 4][..], &[0u8; 8][..]]).is_err());
     }
 
     #[test]

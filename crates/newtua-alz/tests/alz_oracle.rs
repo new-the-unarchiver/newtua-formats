@@ -13,7 +13,7 @@ use std::io::Read;
 use newtua_alz::AlzArchive;
 use newtua_common::crc32::crc32_ieee;
 use newtua_common::deflate::deflate_dynamic;
-use newtua_testutil::{unar_extract_all, unar_installed};
+use newtua_testutil::{unar_extract_all, unar_extract_all_volumes, unar_installed};
 
 const HEADER: [u8; 8] = [b'A', b'L', b'Z', 0x01, 0, 0, 0, 0];
 
@@ -84,8 +84,8 @@ fn build(records: &[Vec<u8>]) -> Vec<u8> {
     a
 }
 
-fn ours(data: &[u8]) -> BTreeMap<String, Vec<u8>> {
-    let arc = AlzArchive::open(data).unwrap();
+/// Extract every member of an already-opened archive into a path → bytes map.
+fn extract(arc: &AlzArchive) -> BTreeMap<String, Vec<u8>> {
     let mut map = BTreeMap::new();
     for (i, e) in arc.entries().iter().enumerate() {
         let mut out = Vec::new();
@@ -93,6 +93,39 @@ fn ours(data: &[u8]) -> BTreeMap<String, Vec<u8>> {
         map.insert(String::from_utf8(e.name().to_vec()).unwrap(), out);
     }
     map
+}
+
+fn ours(data: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    extract(&AlzArchive::open(data).unwrap())
+}
+
+// Note: `unar` cannot cross-check ALZip *encryption* — XADMaster's ALZip parser
+// leaves it unimplemented (`raiseNotSupportedException`; the `XADZipCryptHandle`
+// wiring is commented out), so it refuses encrypted `.alz`. The ZipCrypto cipher
+// itself is instead validated independently against Info-ZIP `zip` in
+// `newtua-common/tests/zipcrypt_oracle.rs`; the ALZ container's encryption wiring
+// is covered by the crate's unit tests.
+
+/// Cut `full` into volumes with the 16-byte junction tail / 8-byte continuation
+/// header framing (mirror of the crate's split helper).
+fn split_into_volumes(full: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
+    let mut bounds = vec![0usize];
+    bounds.extend_from_slice(cuts);
+    bounds.push(full.len());
+    let n = bounds.len() - 1;
+    let mut vols = Vec::new();
+    for k in 0..n {
+        let mut v = Vec::new();
+        if k > 0 {
+            v.extend_from_slice(&[0xEEu8; 8]);
+        }
+        v.extend_from_slice(&full[bounds[k]..bounds[k + 1]]);
+        if k < n - 1 {
+            v.extend_from_slice(&[0xDDu8; 16]);
+        }
+        vols.push(v);
+    }
+    vols
 }
 
 #[test]
@@ -129,5 +162,35 @@ fn four_methods_match_unar() {
         mine,
         unar_extract_all(&alz, "test.alz"),
         "our ALZ extraction disagrees with unar"
+    );
+}
+
+#[test]
+fn multi_volume_matches_unar() {
+    if !unar_installed() {
+        eprintln!("skipping: `unar` not installed");
+        return;
+    }
+
+    let d1 = b"first split member, deflated repeatedly repeatedly. ".repeat(8);
+    let d2 = b"second split member, compressible content over here. ".repeat(9);
+    let full = build(&[
+        record(b"a.bin", 2, &d1, &deflate(&d1)),
+        record(b"b.bin", 2, &d2, &deflate(&d2)),
+    ]);
+
+    // Cut inside member data so members span volume junctions.
+    let cuts = [full.len() / 3, 2 * full.len() / 3];
+    let vols = split_into_volumes(&full, &cuts);
+    let refs: Vec<&[u8]> = vols.iter().map(|v| v.as_slice()).collect();
+
+    let mine = extract(&AlzArchive::open_volumes(&refs).unwrap());
+    // Sanity: the split reassembles to the same members as the single volume.
+    assert_eq!(mine, ours(&full));
+
+    assert_eq!(
+        mine,
+        unar_extract_all_volumes(&refs, "test"),
+        "our split-volume extraction disagrees with unar"
     );
 }
