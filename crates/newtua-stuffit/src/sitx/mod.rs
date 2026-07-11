@@ -13,7 +13,9 @@
 //! as [`io::ErrorKind::Unsupported`], so later stages only need to slot in a
 //! decoder.
 
+mod bwt;
 mod p2;
+mod rangecoder;
 mod x86;
 
 use std::collections::{HashMap, HashSet};
