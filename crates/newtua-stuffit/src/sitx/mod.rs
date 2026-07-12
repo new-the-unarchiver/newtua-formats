@@ -6,16 +6,19 @@
 //! *elements* (files, forks, directories, a catalog) whose data areas are wrapped
 //! in a length-prefixed *block* stream and fed through one of several codecs.
 //!
-//! This stage (19a) brings up the whole container plus the simple codecs —
-//! **None**, the StuffItX **Deflate** variant, and **RC4** (method 5) — with the
-//! **x86** preprocessor. The proprietary codecs (Brimstone, Cyanide, Darkhorse,
-//! Iron, Blend) and the English preprocessor parse their parameters but surface
-//! as [`io::ErrorKind::Unsupported`], so later stages only need to slot in a
+//! Stage 19a brought up the whole container plus the simple codecs — **None**,
+//! the StuffItX **Deflate** variant, and **RC4** (method 5) — with the **x86**
+//! preprocessor. Stage 19g added **Brimstone** (PPMd variant G, `ppmd/`). The
+//! remaining proprietary codecs (Cyanide, Darkhorse, Iron, Blend) and the
+//! English preprocessor parse their parameters but surface as
+//! [`io::ErrorKind::Unsupported`], so later stages only need to slot in a
 //! decoder.
 
+mod brimstone;
 mod bwt;
 mod cyanide;
 mod p2;
+mod ppmd;
 mod rangecoder;
 mod x86;
 
@@ -179,9 +182,17 @@ fn decode_stream(data: &[u8], desc: &StreamDescriptor, want_checksum: bool) -> i
     let decompressed = match desc.compression {
         -1 => blocks,
         0 => {
-            return Err(unsupported(
-                "sitx: Brimstone/PPMd compression is not yet supported",
-            ))
+            // `allocsize=1<<readUInt8()`, `order=readUInt8()`, read from the
+            // deblocked stream by the container's switch before handing off
+            // to the codec (`XADStuffItXParser.m:123-124`).
+            let allocsize_exp = *blocks
+                .first()
+                .ok_or_else(|| invalid("sitx: empty brimstone stream"))?;
+            let order = *blocks
+                .get(1)
+                .ok_or_else(|| invalid("sitx: truncated brimstone stream"))?;
+            let allocsize = 1usize << allocsize_exp;
+            brimstone::decode(&blocks[2..], size, order as u32, allocsize)?
         }
         1 => cyanide::decode(&blocks, size)?,
         2 => {
