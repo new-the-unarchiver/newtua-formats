@@ -198,7 +198,7 @@ impl<'a> RangeCoder<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A mirror encoder for the `uselow=true` decoder form (Cyanide, Iron):
@@ -299,7 +299,7 @@ mod tests {
     /// since our decoder's `new` reads exactly 4 leading bytes rather than
     /// the 5 a textbook LZMA decoder discards the first of — it's dropped
     /// here (`started`) instead of written.
-    struct CarryEncoder {
+    pub(crate) struct CarryEncoder {
         out: Vec<u8>,
         low: u64,
         range: u32,
@@ -309,7 +309,7 @@ mod tests {
     }
 
     impl CarryEncoder {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             CarryEncoder {
                 out: Vec::new(),
                 low: 0,
@@ -357,13 +357,13 @@ mod tests {
             self.normalize();
         }
 
-        fn encode_bit(&mut self, bit: u32) {
+        pub(crate) fn encode_bit(&mut self, bit: u32) {
             let freqs = [1u32, 1];
             let cumulative: u32 = freqs[..bit as usize].iter().sum();
             self.encode(cumulative, cumulative + freqs[bit as usize], 2);
         }
 
-        fn encode_weighted_bit2(&mut self, bit: u32, weight: u32, shift: u32) {
+        pub(crate) fn encode_weighted_bit2(&mut self, bit: u32, weight: u32, shift: u32) {
             let threshold = (self.range >> shift).wrapping_mul(weight);
             if bit == 0 {
                 self.range = threshold;
@@ -374,7 +374,18 @@ mod tests {
             self.normalize();
         }
 
-        fn finish(mut self) -> Vec<u8> {
+        /// Darkhorse's `NextBitWithWeight` mirror (`next_bit_with_weight2`'s
+        /// inverse): same threshold encode, same 1/32 weight adaptation.
+        pub(crate) fn encode_bit_with_weight2(&mut self, bit: u32, weight: &mut u32) {
+            self.encode_weighted_bit2(bit, *weight, 12);
+            if bit == 0 {
+                *weight += (0x1000 - *weight) >> 5;
+            } else {
+                *weight -= *weight >> 5;
+            }
+        }
+
+        pub(crate) fn finish(mut self) -> Vec<u8> {
             for _ in 0..5 {
                 self.shift_low();
             }

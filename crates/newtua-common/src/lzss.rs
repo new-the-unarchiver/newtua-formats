@@ -75,6 +75,14 @@ impl LzssWindow {
             self.push(self.buffer[src], out);
         }
     }
+
+    /// Read the byte at an arbitrary absolute output position (`XADLZSSByteFromWindow`).
+    /// `pos` is masked into the ring exactly as the reference's `absolutepos&windowmask`
+    /// does in C's two's-complement arithmetic — a negative or not-yet-written
+    /// position reaches the ring's zero-initialized backing rather than panicking.
+    pub fn byte_at(&self, pos: i64) -> u8 {
+        self.buffer[(pos & self.mask as i64) as usize]
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +129,26 @@ mod tests {
     #[should_panic(expected = "power of two")]
     fn rejects_non_power_of_two_window() {
         LzssWindow::new(1000);
+    }
+
+    #[test]
+    fn byte_at_reads_an_earlier_absolute_output_position() {
+        let mut w = LzssWindow::new(8);
+        let mut out = Vec::new();
+        for &b in b"abcdef" {
+            w.emit_literal(b, &mut out);
+        }
+        assert_eq!(w.byte_at(0), b'a');
+        assert_eq!(w.byte_at(5), b'f');
+    }
+
+    #[test]
+    fn byte_at_negative_position_reads_the_zero_initialized_ring_slot() {
+        // Matches `XADLZSSByteFromWindow`: a negative absolute position is just
+        // masked into the ring like any other, reaching the not-yet-written
+        // (zero-initialized) tail of a fresh window.
+        let w = LzssWindow::new(8);
+        assert_eq!(w.byte_at(-1), 0);
     }
 
     #[test]

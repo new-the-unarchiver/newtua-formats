@@ -8,15 +8,16 @@
 //!
 //! Stage 19a brought up the whole container plus the simple codecs — **None**,
 //! the StuffItX **Deflate** variant, and **RC4** (method 5) — with the **x86**
-//! preprocessor. Stage 19g added **Brimstone** (PPMd variant G, `ppmd/`). The
-//! remaining proprietary codecs (Cyanide, Darkhorse, Iron, Blend) and the
-//! English preprocessor parse their parameters but surface as
-//! [`io::ErrorKind::Unsupported`], so later stages only need to slot in a
-//! decoder.
+//! preprocessor. Stage 19g added **Brimstone** (PPMd variant G, `ppmd/`). Stage
+//! 19c added **Cyanide** and 19d added **Darkhorse**. The remaining
+//! proprietary codecs (Iron, Blend) and the English preprocessor parse their
+//! parameters but surface as [`io::ErrorKind::Unsupported`], so later stages
+//! only need to slot in a decoder.
 
 mod brimstone;
 mod bwt;
 mod cyanide;
+mod darkhorse;
 mod p2;
 mod ppmd;
 mod rangecoder;
@@ -195,11 +196,7 @@ fn decode_stream(data: &[u8], desc: &StreamDescriptor, want_checksum: bool) -> i
             brimstone::decode(&blocks[2..], size, order as u32, allocsize)?
         }
         1 => cyanide::decode(&blocks, size)?,
-        2 => {
-            return Err(unsupported(
-                "sitx: Darkhorse compression is not yet supported",
-            ))
-        }
+        2 => darkhorse::decode(&blocks, size)?,
         3 => {
             // Modified deflate: one window-size byte, then the deflate stream.
             let windowsize = *blocks
