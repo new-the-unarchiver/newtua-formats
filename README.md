@@ -25,7 +25,7 @@ Done formats are listed plainly; still-queued ones are marked *(planned)*.
 | `newtua-dos` | Squeeze, ARC, LBR, Crunch, Zoo, ARJ |
 | `newtua-mac` | BinHex, MacBinary/AppleSingle/AppleDouble, Compact Pro, PackIt *(DiskDoubler, NowCompress planned)* |
 | `newtua-stuffit` | StuffIt classic, StuffIt 5 *(StuffItX planned)* |
-| `newtua-amiga` | PowerPacker *(Amiga LZX, DMS planned)* |
+| `newtua-amiga` | PowerPacker, Amiga LZX *(DMS planned)* |
 | `newtua-alz` | ALZip |
 | `newtua-nsis` *(planned)* | NSIS |
 | `newtua-testutil` | shared test helpers (not published) |

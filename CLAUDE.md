@@ -35,10 +35,11 @@ is usable standalone by the wider community.
 - Family crates — one per **family**, each format inside being a container parser
   plus its compression methods: `newtua-dos` (Squeeze, ARC, LBR, Crunch, Zoo, ARJ),
   `newtua-mac` (BinHex, MacBinary/AppleSingle/AppleDouble, Compact Pro, PackIt),
-  `newtua-stuffit` (StuffIt classic + StuffIt 5), `newtua-amiga` (PowerPacker),
-  `newtua-alz` (ALZip). `newtua-testutil` holds shared test helpers. Planned but not yet
-  created: `newtua-nsis`; some family crates still have queued formats (see the
-  roadmap). Add a new family crate to the workspace `members` when its first
+  `newtua-stuffit` (StuffIt classic + StuffIt 5 + StuffItX), `newtua-amiga`
+  (PowerPacker, Amiga LZX), `newtua-nsis` (NSIS installer), `newtua-alz` (ALZip).
+  `newtua-testutil` holds shared test helpers. Some family crates still have
+  queued formats (see the roadmap). Add a new family crate to the workspace
+  `members` when its first
   format lands.
 - Each crate exposes a **newtua-agnostic** API (its own `Entry`/`Error` types,
   raw filename bytes — never decode charsets here; newtua does that centrally).
