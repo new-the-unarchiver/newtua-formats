@@ -358,9 +358,54 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn encode_bit(&mut self, bit: u32) {
-            let freqs = [1u32, 1];
-            let cumulative: u32 = freqs[..bit as usize].iter().sum();
-            self.encode(cumulative, cumulative + freqs[bit as usize], 2);
+            self.encode_symbol(&[1, 1], bit as usize);
+        }
+
+        /// Mirror of `next_symbol` (`NextSymbolFromRangeCoder`): a cumulative-
+        /// frequency range over an arbitrary alphabet, shared by every codec's
+        /// symbol-frequency contexts (Iron's `mainfrequencies` and friends).
+        pub(crate) fn encode_symbol(&mut self, freqs: &[u32], symbol: usize) {
+            let total: u32 = freqs.iter().sum();
+            let cumulative: u32 = freqs[..symbol].iter().sum();
+            self.encode(cumulative, cumulative + freqs[symbol], total);
+        }
+
+        /// Mirror of `next_weighted_bit` (`NextWeightedBitFromRangeCoder`).
+        pub(crate) fn encode_weighted_bit(&mut self, bit: u32, weight: u32, size: u32) {
+            if bit == 0 {
+                self.encode(0, weight, size);
+            } else {
+                self.encode(weight, size, size);
+            }
+        }
+
+        /// Mirror of Iron's `NextBitWithWeight` (`next_bit_with_weight`).
+        pub(crate) fn encode_bit_with_weight(&mut self, bit: u32, weight: &mut u32, shift: u32) {
+            self.encode_weighted_bit(bit, *weight, 0x1000);
+            if bit == 0 {
+                *weight += (0x1000 - *weight) >> shift;
+            } else {
+                *weight -= *weight >> shift;
+            }
+        }
+
+        /// Mirror of Iron's `NextBitWithDoubleWeights` (`next_bit_with_double_weights`).
+        pub(crate) fn encode_bit_with_double_weights(
+            &mut self,
+            bit: u32,
+            weight1: &mut u32,
+            shift1: u32,
+            weight2: &mut u32,
+            shift2: u32,
+        ) {
+            self.encode_weighted_bit(bit, (*weight1 + *weight2) / 2, 0x1000);
+            if bit == 0 {
+                *weight1 += (0x1000 - *weight1) >> shift1;
+                *weight2 += (0x1000 - *weight2) >> shift2;
+            } else {
+                *weight1 -= *weight1 >> shift1;
+                *weight2 -= *weight2 >> shift2;
+            }
         }
 
         pub(crate) fn encode_weighted_bit2(&mut self, bit: u32, weight: u32, shift: u32) {

@@ -9,8 +9,8 @@
 //! Stage 19a brought up the whole container plus the simple codecs — **None**,
 //! the StuffItX **Deflate** variant, and **RC4** (method 5) — with the **x86**
 //! preprocessor. Stage 19g added **Brimstone** (PPMd variant G, `ppmd/`). Stage
-//! 19c added **Cyanide** and 19d added **Darkhorse**. The remaining
-//! proprietary codecs (Iron, Blend) and the English preprocessor parse their
+//! 19c added **Cyanide**, 19d added **Darkhorse**, and 19e added **Iron**. The
+//! remaining proprietary codec (Blend) and the English preprocessor parse their
 //! parameters but surface as [`io::ErrorKind::Unsupported`], so later stages
 //! only need to slot in a decoder.
 
@@ -18,6 +18,7 @@ mod brimstone;
 mod bwt;
 mod cyanide;
 mod darkhorse;
+mod iron;
 mod p2;
 mod ppmd;
 mod rangecoder;
@@ -223,7 +224,7 @@ fn decode_stream(data: &[u8], desc: &StreamDescriptor, want_checksum: bool) -> i
             Rc4::new(key).apply(&mut out);
             out
         }
-        6 => return Err(unsupported("sitx: Iron compression is not yet supported")),
+        6 => iron::decode(&blocks, size)?,
         other => {
             return Err(unsupported(format!(
                 "sitx: unknown compression method {other}"

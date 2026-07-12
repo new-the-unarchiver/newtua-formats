@@ -161,6 +161,16 @@ impl MtfState {
         self.table[0] = res;
         res
     }
+
+    /// The index `byte` currently occupies (test-only: a mirror encoder needs to
+    /// invert [`Self::decode`] to find which index would reproduce a target byte).
+    #[cfg(test)]
+    pub(crate) fn find(&self, byte: u8) -> usize {
+        self.table
+            .iter()
+            .position(|&b| b == byte)
+            .expect("every byte value is always present in the table")
+    }
 }
 
 /// Decode a block with the MTF-1/FF-N variant in place (`DecodeM1FFNBlock`,

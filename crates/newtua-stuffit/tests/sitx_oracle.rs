@@ -536,19 +536,20 @@ fn resource_and_data_forks_both_extract() {
 
 #[test]
 fn unsupported_codec_parses_but_read_fails() {
-    // Iron (method 6) is not yet supported (19e): the archive parses
-    // (metadata is available) but reading the fork returns Unsupported.
+    // Blend (method 4) is not yet supported: the archive parses (metadata is
+    // available) but reading the fork returns Unsupported. Iron (method 6) was
+    // the example here through 19d; it gained support in 19e.
     let content = vec![0u8; 8];
     let data = archive(|w| {
         write_file(w, 1, None);
         write_fork(w, 1, 1, 0, content.len() as u64, 0);
         write_catalog(w, &build_catalog(&[b"c.bin"]));
-        write_data(w, 1, content.len() as u64, &[(1, 6)], &content, None);
+        write_data(w, 1, content.len() as u64, &[(1, 4)], &content, None);
         write_end(w);
     });
     let arc = SitxArchive::open(data).unwrap();
     assert_eq!(arc.entries()[0].name(), b"c.bin");
-    assert_eq!(arc.entries()[0].compression_name(), "Iron");
+    assert_eq!(arc.entries()[0].compression_name(), "Method 4");
     let mut buf = Vec::new();
     let err = arc.read_entry(0, &mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
@@ -844,4 +845,76 @@ fn darkhorse_corpus_members_match_unar() {
 		 {archives_unar_cant} archives unar could not parse"
     );
     assert_eq!(members_mismatched, 0, "Darkhorse output diverged from unar");
+}
+
+/// Like `cyanide_corpus_members_match_unar`, but for Iron (compression method 6,
+/// 19e). If the corpus holds no Iron members, this still runs (0 checked) rather
+/// than being skipped, so the "0 skipped" bar in the report is meaningful: the
+/// gate is on the corpus/`unar` being available at all, not on Iron members
+/// existing within it.
+#[test]
+fn iron_corpus_members_match_unar() {
+    let Some(dir) = newtua_testutil::sitx_corpus_dir() else {
+        eprintln!("skipping: NEWTUA_SITX_CORPUS not set");
+        return;
+    };
+    if !newtua_testutil::unar_installed() {
+        eprintln!("skipping: unar not installed");
+        return;
+    }
+
+    let mut members_checked = 0usize;
+    let mut members_mismatched = 0usize;
+    let mut archives_unar_cant = 0usize;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        if !SitxArchive::recognize(&bytes) {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+        let arc = match SitxArchive::open(bytes.clone()) {
+            Ok(a) => a,
+            Err(_) => continue, // not an Iron-relevant failure; the general oracle covers this
+        };
+        let has_iron = arc
+            .entries()
+            .iter()
+            .any(|e| e.compression_name().starts_with("Iron"));
+        if !has_iron {
+            continue;
+        }
+
+        let Some(theirs) = newtua_testutil::try_unar_extract_all(&bytes, &name) else {
+            archives_unar_cant += 1;
+            continue;
+        };
+
+        for (i, en) in arc.entries().iter().enumerate() {
+            if en.is_directory() || !en.compression_name().starts_with("Iron") {
+                continue;
+            }
+            let mut buf = Vec::new();
+            arc.read_entry(i, &mut buf)
+                .unwrap_or_else(|e| panic!("Iron member in {name} failed to decode: {e}"));
+            let mut key = String::from_utf8_lossy(en.name()).into_owned();
+            if en.is_resource_fork() {
+                key.push_str("/..namedfork/rsrc");
+            }
+            members_checked += 1;
+            if theirs.get(&key) != Some(&buf) {
+                members_mismatched += 1;
+                eprintln!("iron mismatch: {name}:{key}");
+            }
+        }
+    }
+    eprintln!(
+        "iron corpus: {members_checked} members checked, {members_mismatched} mismatched, \
+		 {archives_unar_cant} archives unar could not parse"
+    );
+    assert_eq!(members_mismatched, 0, "Iron output diverged from unar");
 }
