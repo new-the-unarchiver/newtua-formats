@@ -49,6 +49,13 @@ impl<'a> PpmdRangeCoder<'a> {
         b
     }
 
+    /// Number of input bytes consumed so far (init read + renormalization),
+    /// so a framed caller (Blend) can resynchronize its cursor past this
+    /// stream's actual consumption (`CSInputSynchronizeFileOffset`).
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
     /// `PPMdRangeCoderCurrentCount` (`.c:17`). Mutates `range` in place,
     /// matching the reference's `self->range/=scale`.
     pub(crate) fn current_count(&mut self, scale: u32) -> u32 {

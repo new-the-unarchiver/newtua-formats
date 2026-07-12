@@ -219,11 +219,15 @@ fn read_u32_be(blocks: &[u8], cursor: &mut usize) -> io::Result<u32> {
     Ok(v)
 }
 
-/// Decode a Cyanide-compressed stream (`produceBlockAtOffset:` driven by
-/// `CSBlockStreamHandle`, `.m:26-57`). `blocks` is the block layer's already
-/// unwrapped output (`p2::read_block_stream`); `size` is only used to size the
-/// output buffer (the block markers alone determine when the stream ends).
-pub(crate) fn decode(blocks: &[u8], size: usize) -> io::Result<Vec<u8>> {
+/// Decode a Cyanide-compressed stream, also reporting how many bytes of
+/// `blocks` were actually consumed — needed by Blend (method 4) to
+/// resynchronize its cursor past this sub-block
+/// (`CSInputSynchronizeFileOffset`, `XADStuffItXBlendHandle.m:111`).
+///
+/// `blocks` is the block layer's already unwrapped output
+/// (`p2::read_block_stream`); `size` is only used to size the output buffer
+/// (the block markers alone determine when the stream ends).
+pub(crate) fn decode_framed(blocks: &[u8], size: usize) -> io::Result<(Vec<u8>, usize)> {
     // `resetBlockStream` (`.m:28`) reads one byte before any block is produced.
     let mut cursor = 1usize;
     let mut out = Vec::with_capacity(size);
@@ -251,7 +255,15 @@ pub(crate) fn decode(blocks: &[u8], size: usize) -> io::Result<Vec<u8>> {
         out.extend_from_slice(&block);
     }
 
-    Ok(out)
+    Ok((out, cursor))
+}
+
+/// Decode a Cyanide-compressed stream (`produceBlockAtOffset:` driven by
+/// `CSBlockStreamHandle`, `.m:26-57`), discarding the consumed count (used by
+/// the container's top-level dispatch, which already knows its stream's full
+/// length).
+pub(crate) fn decode(blocks: &[u8], size: usize) -> io::Result<Vec<u8>> {
+    decode_framed(blocks, size).map(|(out, _consumed)| out)
 }
 
 #[cfg(test)]

@@ -9,11 +9,12 @@
 //! Stage 19a brought up the whole container plus the simple codecs — **None**,
 //! the StuffItX **Deflate** variant, and **RC4** (method 5) — with the **x86**
 //! preprocessor. Stage 19g added **Brimstone** (PPMd variant G, `ppmd/`). Stage
-//! 19c added **Cyanide**, 19d added **Darkhorse**, and 19e added **Iron**. The
-//! remaining proprietary codec (Blend) and the English preprocessor parse their
-//! parameters but surface as [`io::ErrorKind::Unsupported`], so later stages
-//! only need to slot in a decoder.
+//! 19c added **Cyanide**, 19d added **Darkhorse**, 19e added **Iron**, and 19f
+//! added **Blend** (a meta-codec dispatching to the other three by marker).
+//! The English preprocessor still parses its parameters but surfaces as
+//! [`io::ErrorKind::Unsupported`].
 
+mod blend;
 mod brimstone;
 mod bwt;
 mod cyanide;
@@ -210,7 +211,7 @@ fn decode_stream(data: &[u8], desc: &StreamDescriptor, want_checksum: bool) -> i
             }
             deflate::inflate_sitx(&blocks[1..], size)?
         }
-        4 => return Err(unsupported("sitx: Blend compression is not yet supported")),
+        4 => blend::decode(&blocks, size)?,
         5 => {
             // No compression, obscured by RC4: skip two bytes, one key byte, then
             // RC4 over the rest (`XADStuffItXParser.m:158`).
@@ -450,6 +451,7 @@ fn method_name(compression: i64, preprocess: i64) -> String {
         1 => "Cyanide".to_string(),
         2 => "Darkhorse".to_string(),
         3 => "Deflate".to_string(),
+        4 => "Blend".to_string(),
         5 => "None".to_string(),
         6 => "Iron".to_string(),
         other => format!("Method {other}"),

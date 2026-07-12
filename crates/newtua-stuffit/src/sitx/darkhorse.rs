@@ -28,7 +28,9 @@ const INITIAL_WEIGHT: u32 = 0x800;
 
 /// The window size `decode()` actually uses for a given header byte
 /// (`XADStuffItXParser.m:136-137`): `1<<window_byte`, floored to 1 MiB.
-fn windowsize_for(window_byte: u8) -> usize {
+/// `pub(crate)` so Blend's tests (`blend.rs`) can share it when sizing a
+/// Darkhorse sub-block fixture through this module's mirror `tests::Encoder`.
+pub(crate) fn windowsize_for(window_byte: u8) -> usize {
     (1usize << window_byte).max(0x100000)
 }
 
@@ -282,14 +284,19 @@ impl<'a> Darkhorse<'a> {
     }
 }
 
-/// Decode a Darkhorse-compressed stream. `blocks` is the block layer's already
-/// unwrapped output (`p2::read_block_stream`), still carrying the two leading
-/// bytes the container reads before the range-coded body: the window-size
-/// exponent (`blocks[0]`) and one skipped byte (`blocks[1]`,
+/// Decode a Darkhorse-compressed stream, also reporting how many bytes of
+/// `blocks` were actually consumed — needed by Blend (method 4) to
+/// resynchronize its cursor past this sub-block
+/// (`CSInputSynchronizeFileOffset`, `XADStuffItXBlendHandle.m:111`).
+///
+/// `blocks` is the block layer's already unwrapped output
+/// (`p2::read_block_stream`), still carrying the two leading bytes the
+/// container reads before the range-coded body: the window-size exponent
+/// (`blocks[0]`) and one skipped byte (`blocks[1]`,
 /// `CSInputSkipBytes(input,1)` inside `resetLZSSHandle`) — see
 /// `XADStuffItXParser.m:135-142` and `.m:57-58`. `size` is only used to know
 /// when to stop; the stream may also end early via the `len==0x111` marker.
-pub(crate) fn decode(blocks: &[u8], size: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn decode_framed(blocks: &[u8], size: usize) -> io::Result<(Vec<u8>, usize)> {
     let window_byte = *blocks.first().ok_or_else(truncated)?;
     blocks.get(1).ok_or_else(truncated)?;
     if window_byte >= 31 {
@@ -313,11 +320,19 @@ pub(crate) fn decode(blocks: &[u8], size: usize) -> io::Result<Vec<u8>> {
             Symbol::End => break,
         }
     }
-    Ok(out)
+    let consumed = 2 + dh.coder.position();
+    Ok((out, consumed))
+}
+
+/// Decode a Darkhorse-compressed stream, discarding the consumed count (used
+/// by the container's top-level dispatch, which already knows its stream's
+/// full length).
+pub(crate) fn decode(blocks: &[u8], size: usize) -> io::Result<Vec<u8>> {
+    decode_framed(blocks, size).map(|(out, _consumed)| out)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The mirror encoder for `RangeCoder::new(_, uselow=false, bottom=0)`
@@ -411,8 +426,10 @@ mod tests {
     /// Mirrors `Darkhorse`'s full field set plus an LZSS window and position
     /// counter, so it can replay the exact same adaptive-weight and
     /// window-guess bookkeeping the decoder does while emitting bits instead
-    /// of reading them.
-    struct Encoder {
+    /// of reading them. `pub(crate)` (with a few methods below) so Blend's
+    /// tests can build a real Darkhorse sub-block fixture instead of
+    /// duplicating this bookkeeping.
+    pub(crate) struct Encoder {
         bits: BitEncoder,
         window: LzssWindow,
         pos: i64,
@@ -436,7 +453,7 @@ mod tests {
     }
 
     impl Encoder {
-        fn new(window_size: usize) -> Self {
+        pub(crate) fn new(window_size: usize) -> Self {
             Encoder {
                 bits: BitEncoder::new(),
                 window: LzssWindow::new(window_size),
@@ -586,7 +603,7 @@ mod tests {
             self.pos += length as i64;
         }
 
-        fn literal(&mut self, byte: u8) {
+        pub(crate) fn literal(&mut self, byte: u8) {
             let idx = (self.pos & 3) as usize;
             self.bits
                 .encode_bit_with_weight2(0, &mut self.flagweights[idx]);
@@ -651,7 +668,7 @@ mod tests {
 
         /// Assemble the final `blocks` slice (`[window_byte, skipped_byte, ..coded bytes..]`)
         /// alongside the plaintext `decode()` should reproduce.
-        fn finish(self, window_byte: u8) -> (Vec<u8>, Vec<u8>) {
+        pub(crate) fn finish(self, window_byte: u8) -> (Vec<u8>, Vec<u8>) {
             let mut blocks = vec![window_byte, 0u8];
             blocks.extend(self.bits.finish());
             (blocks, self.expected)

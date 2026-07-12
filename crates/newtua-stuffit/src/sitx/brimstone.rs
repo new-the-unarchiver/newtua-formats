@@ -11,20 +11,22 @@ use std::io;
 
 use super::ppmd::variant_g;
 
-/// Decode a Brimstone-compressed stream (`produceByteAtOffset:` driven by
-/// `CSByteStreamHandle`, `XADPPMdHandles.m:143`).
+/// Decode a Brimstone-compressed stream, also reporting how many bytes of
+/// `src` the model's range coder actually consumed — needed by Blend
+/// (method 4) to resynchronize its cursor past this sub-block
+/// (`CSInputSynchronizeFileOffset`, `XADStuffItXBlendHandle.m:111`).
 ///
-/// `src` is the compressed body *after* the two header bytes the container's
-/// switch already consumed (`allocsize=1<<readUInt8()`, `order=readUInt8()`,
+/// `src` is the compressed body *after* the two header bytes the caller
+/// already consumed (`allocsize=1<<readUInt8()`, `order=readUInt8()`,
 /// `XADStuffItXParser.m:123-124`) — `alloc_size` and `order` are those two
 /// values, already decoded by the caller. Produces up to `outlen` bytes,
 /// stopping early if the model signals EOF (`NextPPMdVariantGByte`<0`).
-pub(crate) fn decode(
+pub(crate) fn decode_framed(
     src: &[u8],
     outlen: usize,
     order: u32,
     alloc_size: usize,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<(Vec<u8>, usize)> {
     let mut model = variant_g::start(src, alloc_size as u32, order as i32, true);
     let mut out = Vec::with_capacity(outlen);
     for _ in 0..outlen {
@@ -34,7 +36,21 @@ pub(crate) fn decode(
         }
         out.push(b as u8);
     }
-    Ok(out)
+    let consumed = model.core.coder.position();
+    Ok((out, consumed))
+}
+
+/// Decode a Brimstone-compressed stream (`produceByteAtOffset:` driven by
+/// `CSByteStreamHandle`, `XADPPMdHandles.m:143`), discarding the consumed
+/// count (used by the container's top-level dispatch, which already knows
+/// its stream's full length).
+pub(crate) fn decode(
+    src: &[u8],
+    outlen: usize,
+    order: u32,
+    alloc_size: usize,
+) -> io::Result<Vec<u8>> {
+    decode_framed(src, outlen, order, alloc_size).map(|(out, _consumed)| out)
 }
 
 #[cfg(test)]
