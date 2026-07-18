@@ -1,7 +1,8 @@
 [package]
 name = "newtua-stuffit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Decoders for the StuffIt family of classic Macintosh archives (classic .sit, StuffIt 5, and StuffItX)."
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
