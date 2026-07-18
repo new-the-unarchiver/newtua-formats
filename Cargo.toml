@@ -17,7 +17,7 @@ members = [
 edition = "2021"
 rust-version = "1.74"
 license = "LGPL-3.0-or-later"
-repository = "https://github.com/trankov/newtua-formats"
+repository = "https://github.com/new-the-unarchiver/newtua-formats"
 categories = ["compression", "parser-implementations"]
 keywords = ["archive", "decompression", "retro", "legacy"]
 
