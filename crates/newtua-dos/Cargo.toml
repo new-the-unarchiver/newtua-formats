@@ -1,6 +1,6 @@
 [package]
 name = "newtua-dos"
-version = "0.1.1"
+version = "0.1.2"
 description = "Decoders for DOS/CP-M era archive formats: Squeeze, ARC, LBR, Crunch, Zoo, ARJ."
 readme = "README.md"
 edition.workspace = true
