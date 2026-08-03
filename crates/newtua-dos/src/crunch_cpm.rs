@@ -97,6 +97,13 @@ impl<R: Read> CrunchCpmReader<R> {
         Ok(this)
     }
 
+    /// How many bytes of the compressed stream have been consumed. The trailing
+    /// checksum sits right here, wherever the codes happened to end — not at the
+    /// end of the file. See [`CrunchArchive::read_entry`].
+    pub fn bytes_read(&self) -> u64 {
+        self.bits.bytes_read()
+    }
+
     // --- new variant ------------------------------------------------------
 
     /// `CRUNCHinitb2`: reset both tables and enter the atomic + reserved codes.
@@ -463,6 +470,12 @@ impl<R: Read> CrunchLzhufReader<R> {
         Ok(this)
     }
 
+    /// How many bytes of the compressed stream have been consumed — where the
+    /// trailing checksum starts. See [`CrunchArchive::read_entry`].
+    pub fn bytes_read(&self) -> u64 {
+        self.bits.bytes_read()
+    }
+
     /// Build the initial balanced Huffman tree (`StartHuff`).
     fn init_tree(&mut self) {
         for i in 0..N_CHAR {
@@ -779,39 +792,50 @@ impl CrunchArchive {
     /// Decode the member and write it to `out`, verifying the optional trailing
     /// byte-sum checksum. LZW (`0xfe`) is decoded through RLE90 ("type 2");
     /// LZHUF (`0xfd`, "CrLZH") is decoded directly with no RLE90 layer.
+    ///
+    /// **The checksum sits where the codes end, not where the file ends.** Both
+    /// codecs stop on an explicit end-of-data code, and CP/M then padded the
+    /// file with `0x1A` up to a 128-byte record boundary — so on a real
+    /// `AUTOTOG.CZM` the two checksum bytes are at offset 354 of a 384-byte
+    /// file, with thirty `0x1A` bytes after them. Reading the last two bytes of
+    /// the file instead compared the byte sum against `0x1A1A` and rejected a
+    /// perfectly good archive that `unar` unpacks. libxad does not have this
+    /// bug: it calls `xadIOGetChar` twice on the *input stream* right after the
+    /// decoder returns, which is exactly "the two bytes after the codes".
     pub fn read_entry(&self, idx: usize, out: &mut dyn Write) -> io::Result<()> {
         if idx != 0 {
             return Err(decrunch("crunch: index out of range"));
         }
 
-        // The compressed data runs to the end, less the 2-byte checksum if any.
-        let end = if self.haschecksum {
-            self.data
-                .len()
-                .checked_sub(2)
-                .filter(|&e| e >= self.data_offset)
-                .ok_or_else(|| decrunch("crunch: truncated (no checksum)"))?
-        } else {
-            self.data.len()
-        };
-        let comp = &self.data[self.data_offset..end];
+        // Hand the decoder everything from the data offset on: it stops at its
+        // own end code, so the checksum and the padding behind it are never
+        // mistaken for compressed data.
+        let comp = &self.data[self.data_offset..];
 
         let mut decoded = Vec::new();
-        match self.crunch_type {
+        let consumed = match self.crunch_type {
             0xfe => {
                 let lzw = CrunchCpmReader::new(comp, self.old)?;
-                Rle90Reader::new_type2(lzw).read_to_end(&mut decoded)?;
+                let mut rle = Rle90Reader::new_type2(lzw);
+                rle.read_to_end(&mut decoded)?;
+                rle.get_ref().bytes_read()
             }
             // LZHUF emits final bytes directly; there is no RLE90 stage.
             _ => {
-                CrunchLzhufReader::new(comp, self.old)?.read_to_end(&mut decoded)?;
+                let mut lzh = CrunchLzhufReader::new(comp, self.old)?;
+                lzh.read_to_end(&mut decoded)?;
+                lzh.bytes_read()
             }
-        }
+        };
 
         if self.haschecksum {
+            let at = self.data_offset + usize::try_from(consumed).unwrap_or(usize::MAX);
+            let stored = self
+                .data
+                .get(at..at + 2)
+                .ok_or_else(|| decrunch("crunch: truncated (no checksum)"))?;
+            let correct = u16::from_le_bytes([stored[0], stored[1]]);
             let sum: u32 = decoded.iter().map(|&b| u32::from(b)).sum();
-            let n = self.data.len();
-            let correct = u16::from_le_bytes([self.data[n - 2], self.data[n - 1]]);
             if (sum & 0xffff) as u16 != correct {
                 return Err(decrunch("crunch: checksum mismatch"));
             }

@@ -39,6 +39,14 @@ impl<R: Read> Rle90Reader<R> {
             type2,
         }
     }
+
+    /// The wrapped reader. RLE90 is the outermost decoding layer of some
+    /// formats (CP/M Crunch), and whatever follows the compressed stream — a
+    /// trailing checksum — is located by asking the *inner* decoder how far
+    /// into the input it actually got.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
 }
 
 impl<R: Read> Read for Rle90Reader<R> {

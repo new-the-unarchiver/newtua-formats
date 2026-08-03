@@ -145,6 +145,54 @@ fn new_rle90_expansion_and_checksum_match_unar() {
     assert_eq!(ours(&file), unar_extract_one(&file, "oracle.crunch"));
 }
 
+/// Regression: a real CP/M file is padded with `0x1A` up to a 128-byte record
+/// boundary, so the checksum is followed by filler rather than ending the file.
+/// The checksum used to be read from the *last two bytes of the file* — which on
+/// such a file are `0x1A 0x1A` — and a sound archive was rejected with
+/// "checksum mismatch". `AUTOTOG.CZM` from the sembiance corpus is exactly this
+/// shape: 384 bytes, checksum at offset 354, thirty `0x1A` behind it, and `unar`
+/// unpacks it without complaint.
+#[test]
+fn checksum_is_read_where_the_codes_end_not_at_end_of_file() {
+    let pre_rle = [b'X', 0x90, 0x05];
+    let expanded = vec![b'X'; 5];
+
+    let mut file = with_checksum(
+        container(0xfe, "oracle", 0x20, 0, &encode_new(&pre_rle)),
+        &expanded,
+    );
+    let unpadded = file.len();
+    file.resize(unpadded.div_ceil(128) * 128, 0x1A);
+    assert!(file.len() > unpadded, "the test needs actual padding");
+
+    assert_eq!(ours(&file), expanded);
+    if unar_installed() {
+        assert_eq!(ours(&file), unar_extract_one(&file, "oracle.crunch"));
+    }
+}
+
+/// The other side of the same rule: a checksum that genuinely disagrees must
+/// still be caught. Without this, "read the checksum from the right place"
+/// could be satisfied by not checking at all.
+#[test]
+fn a_wrong_checksum_is_still_rejected() {
+    let pre_rle = [b'X', 0x90, 0x05];
+    let mut file = with_checksum(
+        container(0xfe, "oracle", 0x20, 0, &encode_new(&pre_rle)),
+        b"not the real content",
+    );
+    file.resize(file.len().div_ceil(128) * 128, 0x1A);
+
+    let arc = CrunchArchive::open(&file[..]).unwrap();
+    let err = arc
+        .read_entry(0, &mut Vec::new())
+        .expect_err("a wrong checksum must be reported");
+    assert!(
+        err.to_string().contains("checksum mismatch"),
+        "unexpected error: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Old-variant ("LZW 1.0") literal encoder: replicate CRUNCHenterxOLD to learn
 // which fixed-12-bit code each atomic byte was assigned.

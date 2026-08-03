@@ -79,6 +79,7 @@ pub struct BitReaderMsb<R> {
     inner: R,
     acc: u32,
     nbits: u8,
+    bytes_read: u64,
 }
 
 impl<R: Read> BitReaderMsb<R> {
@@ -91,7 +92,20 @@ impl<R: Read> BitReaderMsb<R> {
             inner,
             acc: 0,
             nbits: 0,
+            bytes_read: 0,
         }
+    }
+
+    /// How many whole bytes have been pulled from `inner` so far.
+    ///
+    /// Refills happen one byte at a time, so this is also the offset of the next
+    /// byte a plain byte-wise reader would see — which is what a format needs
+    /// when a trailer (a checksum, a next member) follows the bit stream at
+    /// whatever position it happened to end. A partly-consumed byte counts as
+    /// read, matching libxad's `xadIOGetChar`: it hands out the next *whole*
+    /// byte, and leftover bits of the current one are gone.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 
     /// Read the next `n`-bit code (`n` ≤ 24), most-significant bit first.
@@ -102,6 +116,7 @@ impl<R: Read> BitReaderMsb<R> {
                 Some(b) => {
                     self.acc = (self.acc << 8) | u32::from(b);
                     self.nbits += 8;
+                    self.bytes_read += 1;
                 }
                 None => return Ok(None),
             }
@@ -125,6 +140,7 @@ impl<R: Read> BitReaderMsb<R> {
                 Some(b) => {
                     self.acc = (self.acc << 8) | u32::from(b);
                     self.nbits += 8;
+                    self.bytes_read += 1;
                 }
                 None => return Ok(None),
             }
