@@ -75,6 +75,8 @@ pub struct ZooEntry {
     compsize: usize,
     dataoffset: usize,
     is_deleted: bool,
+    modification_date: u16,
+    modification_time: u16,
 }
 
 impl ZooEntry {
@@ -86,6 +88,24 @@ impl ZooEntry {
     pub fn size(&self) -> u64 {
         self.uncompsize as u64
     }
+
+    /// MS-DOS packed modification date word: bits 15..9 year since 1980,
+    /// 8..5 month, 4..0 day. `0` when the archive recorded none.
+    ///
+    /// Handed out raw on purpose. MS-DOS stored the clock on the wall and no
+    /// timezone at all, so only the caller knows which zone to read it in;
+    /// turning it into an instant here would bake in a guess and put every
+    /// extracted file hours away from the time its author saw.
+    pub fn modification_date(&self) -> u16 {
+        self.modification_date
+    }
+
+    /// MS-DOS packed modification time word: bits 15..11 hour, 10..5 minute,
+    /// 4..0 seconds *divided by two* — the format has two-second resolution.
+    pub fn modification_time(&self) -> u16 {
+        self.modification_time
+    }
+
     /// Zoo stores no directory entries — directories appear only as path
     /// prefixes — so this is always `false`. Provided for API parity.
     pub fn is_dir(&self) -> bool {
@@ -196,8 +216,8 @@ fn parse(data: &[u8]) -> io::Result<Vec<ZooEntry>> {
         let method = rd_u8(data, &mut pos)?;
         let nextdirentry = rd_u32(data, &mut pos)? as usize;
         let dataoffset = rd_u32(data, &mut pos)? as usize;
-        let _date = rd_u16(data, &mut pos)?;
-        let _time = rd_u16(data, &mut pos)?;
+        let modification_date = rd_u16(data, &mut pos)?;
+        let modification_time = rd_u16(data, &mut pos)?;
         let crc16 = rd_u16(data, &mut pos)?;
         let uncompsize = rd_u32(data, &mut pos)? as usize;
         let compsize = rd_u32(data, &mut pos)? as usize;
@@ -278,6 +298,8 @@ fn parse(data: &[u8]) -> io::Result<Vec<ZooEntry>> {
             compsize,
             dataoffset,
             is_deleted: deleted != 0,
+            modification_date,
+            modification_time,
         });
 
         pos = nextdirentry;
@@ -397,6 +419,9 @@ mod tests {
         generation: u8,
         deleted: bool,
         data: Vec<u8>,
+        /// Слова даты и времени MS-DOS.
+        modification_date: u16,
+        modification_time: u16,
     }
 
     impl E {
@@ -413,6 +438,8 @@ mod tests {
                 generation: 0,
                 deleted: false,
                 data: c.to_vec(),
+                modification_date: 0,
+                modification_time: 0,
             }
         }
     }
@@ -424,6 +451,8 @@ mod tests {
         r[4] = e.typ;
         r[5] = e.method;
         // 6..10 nextdirentry, 10..14 dataoffset: patched by build_zoo.
+        r[14..16].copy_from_slice(&e.modification_date.to_le_bytes());
+        r[16..18].copy_from_slice(&e.modification_time.to_le_bytes());
         r[18..20].copy_from_slice(&e.crc16.to_le_bytes());
         r[20..24].copy_from_slice(&e.uncompsize.to_le_bytes());
         r[24..28].copy_from_slice(&(e.data.len() as u32).to_le_bytes());
@@ -803,5 +832,30 @@ mod tests {
         // First directory entry begins at firstoffset 0x22; clobber its magic.
         zoo[0x22] ^= 0xff;
         assert!(ZooArchive::open(&zoo[..]).is_err());
+    }
+
+    /// Дата и время должны доезжать до вызывающего в исходном виде.
+    ///
+    /// Zoo хранит их двумя словами MS-DOS, и разбор их читал и выбрасывал —
+    /// каждый файл выходил датированным моментом распаковки. Отдаём как есть:
+    /// часового пояса в них нет, читать в какой зоне — решать вызывающему.
+    #[test]
+    fn keeps_the_dos_date_and_time_words() {
+        let date = (9u16 << 9) | (6 << 5) | 8; // 1989-06-08
+        let time = (15u16 << 11) | (48 << 5) | 18; // 15:48:36
+        let mut e = E::stored(0x2C, "A.TXT", b"hi");
+        e.modification_date = date;
+        e.modification_time = time;
+        let z = ZooArchive::open(&build_zoo(&[e])[..]).unwrap();
+        assert_eq!(z.entries()[0].modification_date(), date);
+        assert_eq!(z.entries()[0].modification_time(), time);
+    }
+
+    /// Отсутствие даты — это ноль, а не выдуманное значение.
+    #[test]
+    fn absent_date_stays_zero() {
+        let z = ZooArchive::open(&build_zoo(&[E::stored(0x2C, "A.TXT", b"hi")])[..]).unwrap();
+        assert_eq!(z.entries()[0].modification_date(), 0);
+        assert_eq!(z.entries()[0].modification_time(), 0);
     }
 }

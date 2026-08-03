@@ -45,6 +45,7 @@ pub struct ArjEntry {
     datalen: usize,
     is_dir: bool,
     is_encrypted: bool,
+    modification: u32,
 }
 
 impl ArjEntry {
@@ -64,6 +65,23 @@ impl ArjEntry {
     pub fn is_encrypted(&self) -> bool {
         self.is_encrypted
     }
+    /// MS-DOS packed modification date word: bits 15..9 year since 1980,
+    /// 8..5 month, 4..0 day. `0` when the archive recorded none.
+    ///
+    /// ARJ packs date and time into one 32-bit field, date in the high half;
+    /// they are split here so the accessors match the other DOS containers.
+    /// Handed out raw on purpose: MS-DOS stored the clock on the wall and no
+    /// timezone at all, so only the caller knows which zone to read it in.
+    pub fn modification_date(&self) -> u16 {
+        (self.modification >> 16) as u16
+    }
+
+    /// MS-DOS packed modification time word: bits 15..11 hour, 10..5 minute,
+    /// 4..0 seconds *divided by two* — the format has two-second resolution.
+    pub fn modification_time(&self) -> u16 {
+        self.modification as u16
+    }
+
     /// The compression method: 0 stored, 1/2/3 LZH-static, 4 fastest.
     pub fn method(&self) -> u8 {
         self.method
@@ -246,7 +264,7 @@ fn parse(data: &[u8]) -> io::Result<Vec<ArjEntry>> {
         let method = rd_u8(data, &mut cur)?;
         let filetype = rd_u8(data, &mut cur)?;
         let _passwordmod = rd_u8(data, &mut cur)?;
-        let _modification = rd_u32(data, &mut cur)?;
+        let modification = rd_u32(data, &mut cur)?;
         let compsize = rd_u32(data, &mut cur)? as usize;
         let size = rd_u32(data, &mut cur)? as usize;
         let crc = rd_u32(data, &mut cur)?;
@@ -279,6 +297,7 @@ fn parse(data: &[u8]) -> io::Result<Vec<ArjEntry>> {
             datalen: compsize,
             is_dir: filetype == 3,
             is_encrypted: flags & 0x01 != 0,
+            modification,
         });
 
         cur = dataoffset + compsize;
@@ -402,6 +421,8 @@ mod tests {
         size: u32,
         crc: u32,
         data: Vec<u8>,
+        /// Упакованное поле даты/времени MS-DOS: дата в старшей половине.
+        modification: u32,
     }
 
     impl M {
@@ -416,6 +437,7 @@ mod tests {
                 size: c.len() as u32,
                 crc: crc32_ieee(c),
                 data: c.to_vec(),
+                modification: 0,
             }
         }
     }
@@ -452,6 +474,7 @@ mod tests {
         h[5] = m.method;
         h[6] = m.filetype;
         h[7] = m.passwordmod;
+        h[8..12].copy_from_slice(&m.modification.to_le_bytes());
         h[12..16].copy_from_slice(&(m.data.len() as u32).to_le_bytes()); // compsize
         h[16..20].copy_from_slice(&m.size.to_le_bytes());
         h[20..24].copy_from_slice(&m.crc.to_le_bytes());
@@ -574,6 +597,7 @@ mod tests {
             size: decoded.len() as u32,
             crc: crc32_ieee(decoded),
             data: stream,
+            modification: 0,
         }
     }
 
@@ -846,5 +870,32 @@ mod tests {
         let arj = build_arj(&[m]);
         let arc = ArjArchive::open(&arj[..]).unwrap();
         assert_eq!(read(&arc, 0).unwrap(), decoded);
+    }
+
+    /// Дата и время должны доезжать до вызывающего в исходном виде.
+    ///
+    /// ARJ пакует их в одно 32-битное поле, дата в старшей половине. Разбор
+    /// его читал и выбрасывал, поэтому файл из архива 1989 года выходил
+    /// датированным сегодняшним днём. Отдаём слова как есть: часового пояса
+    /// в них нет, и решать, в каком читать, может только вызывающий.
+    #[test]
+    fn keeps_the_dos_date_and_time_words() {
+        let date = (9u16 << 9) | (6 << 5) | 8; // 1989-06-08
+        let time = (15u16 << 11) | (48 << 5) | 18; // 15:48:36
+        let packed = (u32::from(date) << 16) | u32::from(time);
+
+        let mut m = M::stored(b"A.TXT", b"hi");
+        m.modification = packed;
+        let a = ArjArchive::open(&build_arj(&[m])[..]).unwrap();
+        assert_eq!(a.entries()[0].modification_date(), date);
+        assert_eq!(a.entries()[0].modification_time(), time);
+    }
+
+    /// Отсутствие даты — это ноль, а не выдуманное значение.
+    #[test]
+    fn absent_date_stays_zero() {
+        let a = ArjArchive::open(&build_arj(&[M::stored(b"A.TXT", b"hi")])[..]).unwrap();
+        assert_eq!(a.entries()[0].modification_date(), 0);
+        assert_eq!(a.entries()[0].modification_time(), 0);
     }
 }

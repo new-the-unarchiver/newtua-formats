@@ -53,6 +53,8 @@ pub struct ArcEntry {
     compressed_size: u32,
     data_offset: usize,
     crc16: u16,
+    modification_date: u16,
+    modification_time: u16,
 }
 
 impl ArcEntry {
@@ -65,6 +67,24 @@ impl ArcEntry {
     pub fn is_dir(&self) -> bool {
         self.is_dir
     }
+
+    /// MS-DOS packed modification date word: bits 15..9 year since 1980,
+    /// 8..5 month, 4..0 day. `0` when the archive recorded none.
+    ///
+    /// Handed out raw on purpose. MS-DOS stored the clock on the wall and no
+    /// timezone at all, so only the caller knows which zone to read it in;
+    /// turning it into an instant here would bake in a guess and put every
+    /// extracted file hours away from the time its author saw.
+    pub fn modification_date(&self) -> u16 {
+        self.modification_date
+    }
+
+    /// MS-DOS packed modification time word: bits 15..11 hour, 10..5 minute,
+    /// 4..0 seconds *divided by two* — the format has two-second resolution.
+    pub fn modification_time(&self) -> u16 {
+        self.modification_time
+    }
+
     /// The ARC compression method (low 7 bits).
     pub fn method(&self) -> u8 {
         self.method
@@ -177,8 +197,8 @@ fn parse(data: &[u8]) -> io::Result<Vec<ArcEntry>> {
         pos += 13;
 
         let compressed_size = rd_u32(data, &mut pos)?;
-        let _date = rd_u16(data, &mut pos)?;
-        let _time = rd_u16(data, &mut pos)?;
+        let modification_date = rd_u16(data, &mut pos)?;
+        let modification_time = rd_u16(data, &mut pos)?;
         let crc16 = rd_u16(data, &mut pos)?;
         let uncompressed_size = if method == 1 {
             compressed_size
@@ -208,6 +228,8 @@ fn parse(data: &[u8]) -> io::Result<Vec<ArcEntry>> {
             compressed_size: if is_dir { 0 } else { compressed_size },
             data_offset,
             crc16,
+            modification_date,
+            modification_time,
         });
         if is_dir {
             dirs.push(name);
@@ -296,12 +318,25 @@ mod tests {
     /// Build a member with an explicit method, payload, and the uncompressed
     /// content (used for the CRC).
     fn member(method: u8, name: &[u8], payload: &[u8], content: &[u8]) -> Vec<u8> {
+        member_dated(method, name, payload, content, 0, 0)
+    }
+
+    /// Same, with the MS-DOS date/time words spelled out.
+    fn member_dated(
+        method: u8,
+        name: &[u8],
+        payload: &[u8],
+        content: &[u8],
+        date: u16,
+        time: u16,
+    ) -> Vec<u8> {
         let mut e = vec![0x1A, method];
         let mut nm = [0u8; 13];
         nm[..name.len()].copy_from_slice(name);
         e.extend_from_slice(&nm);
         e.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // compsize
-        e.extend_from_slice(&[0, 0, 0, 0]); // date, time
+        e.extend_from_slice(&date.to_le_bytes());
+        e.extend_from_slice(&time.to_le_bytes());
         e.extend_from_slice(&crc16_arc(content).to_le_bytes()); // crc16
         e.extend_from_slice(&(content.len() as u32).to_le_bytes()); // uncompsize
         e.extend_from_slice(payload);
@@ -428,5 +463,32 @@ mod tests {
         let a = archive(&[member(0x0c, b"c", b"....", b"....")]);
         let arc = ArcArchive::open(&a[..]).unwrap();
         assert!(read(&arc, 0).is_err());
+    }
+
+    /// Дата и время должны доезжать до вызывающего в исходном виде.
+    ///
+    /// ARC хранит их двумя словами MS-DOS, и разбор их читал и выбрасывал —
+    /// то есть каждый файл из такого архива выходил датированным моментом
+    /// распаковки, а не тем, когда его сделали. Отдаём слова как есть:
+    /// часового пояса в них нет, и решать, в каком читать, может только
+    /// вызывающий.
+    #[test]
+    fn keeps_the_dos_date_and_time_words() {
+        // 1989-06-08 15:48:36 -> дата (9<<9)|(6<<5)|8, время (15<<11)|(48<<5)|18
+        let date = (9u16 << 9) | (6 << 5) | 8;
+        let time = (15u16 << 11) | (48 << 5) | 18;
+        let a = archive(&[member_dated(0x02, b"A.TXT", b"hi", b"hi", date, time)]);
+        let arc = ArcArchive::open(&a[..]).unwrap();
+        assert_eq!(arc.entries()[0].modification_date(), date);
+        assert_eq!(arc.entries()[0].modification_time(), time);
+    }
+
+    /// Отсутствие даты — это ноль, а не выдуманное значение.
+    #[test]
+    fn absent_date_stays_zero() {
+        let a = archive(&[stored(b"A.TXT", b"hi")]);
+        let arc = ArcArchive::open(&a[..]).unwrap();
+        assert_eq!(arc.entries()[0].modification_date(), 0);
+        assert_eq!(arc.entries()[0].modification_time(), 0);
     }
 }
