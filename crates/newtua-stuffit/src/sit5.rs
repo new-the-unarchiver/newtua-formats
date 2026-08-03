@@ -146,6 +146,20 @@ impl StuffIt5Entry {
     }
 }
 
+/// What [`StuffIt5Archive::password_status`] found: whether this archive needs
+/// a password at all, and whether the one it was opened with is the right one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordStatus {
+    /// The archive is not encrypted; no password is needed.
+    NotEncrypted,
+    /// Encrypted, and opened without a password.
+    Missing,
+    /// Encrypted, and the password given does not match the stored hash.
+    Wrong,
+    /// Encrypted, and the password given matches.
+    Correct,
+}
+
 /// A parsed StuffIt 5 archive: its raw body bytes plus the flattened catalog.
 pub struct StuffIt5Archive {
     data: Vec<u8>,
@@ -153,7 +167,6 @@ pub struct StuffIt5Archive {
     /// Archive password hash, present when the archive is encrypted.
     password_hash: Option<[u8; KEY_LENGTH]>,
     /// Whether the archive as a whole is marked encrypted.
-    #[allow(dead_code)]
     is_encrypted: bool,
     /// The password supplied to [`Self::open_with_password`], raw bytes.
     password: Option<Vec<u8>>,
@@ -205,6 +218,36 @@ impl StuffIt5Archive {
     /// each file's resource fork before its data fork.
     pub fn entries(&self) -> &[StuffIt5Entry] {
         &self.entries
+    }
+
+    /// Whether the archive as a whole is marked encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.is_encrypted
+    }
+
+    /// Check the password remembered by
+    /// [`open_with_password`](Self::open_with_password) against the archive's
+    /// stored hash, **without decoding anything**.
+    ///
+    /// This is the cheap half of [`entry_key`](Self::entry_key) —
+    /// `MD5(MD5(password)[..5])[..5]` compared against the hash in the header —
+    /// so a caller can learn that a password is missing or wrong before writing
+    /// the first byte to disk, instead of finding out mid-extraction with half
+    /// the files already out.
+    pub fn password_status(&self) -> PasswordStatus {
+        if !self.is_encrypted {
+            return PasswordStatus::NotEncrypted;
+        }
+        let Some(password) = self.password.as_deref() else {
+            return PasswordStatus::Missing;
+        };
+        match self.password_hash {
+            Some(hash) if stuffit_md5(&stuffit_md5(password)) == hash => PasswordStatus::Correct,
+            // A header claiming encryption but carrying no hash leaves nothing
+            // to check against. Reporting that as wrong is the safe reading:
+            // the alternative promises a password works and fails later.
+            _ => PasswordStatus::Wrong,
+        }
     }
 
     /// Write entry `idx`'s decoded fork bytes to `out`. Directories write

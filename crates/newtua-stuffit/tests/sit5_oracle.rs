@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use newtua_common::crc16::crc16_arc;
 use newtua_common::md5::md5;
 use newtua_common::rc4::Rc4;
-use newtua_stuffit::sit5::StuffIt5Archive;
+use newtua_stuffit::sit5::{PasswordStatus, StuffIt5Archive};
 use newtua_testutil::unar_installed;
 
 const SIT5_ID: u32 = 0xA5A5_A5A5;
@@ -452,6 +452,44 @@ fn mirror_roundtrip_encrypted() {
     let mut out = Vec::new();
     a.read_entry(0, &mut out).unwrap();
     assert_eq!(out, content);
+}
+
+/// The password can be judged from the header alone, before a byte is decoded —
+/// which is what lets an extractor refuse up front instead of stopping halfway
+/// with files already on disk.
+#[test]
+fn password_status_answers_before_anything_is_decoded() {
+    let arc = build_encrypted_sit(b"secret", b"hidden", 3);
+
+    assert_eq!(
+        StuffIt5Archive::open(&arc[..]).unwrap().password_status(),
+        PasswordStatus::Missing
+    );
+    assert_eq!(
+        StuffIt5Archive::open_with_password(&arc[..], b"wrong")
+            .unwrap()
+            .password_status(),
+        PasswordStatus::Wrong
+    );
+    assert_eq!(
+        StuffIt5Archive::open_with_password(&arc[..], PASSWORD)
+            .unwrap()
+            .password_status(),
+        PasswordStatus::Correct
+    );
+    assert!(StuffIt5Archive::open_with_password(&arc[..], PASSWORD)
+        .unwrap()
+        .is_encrypted());
+}
+
+/// An ordinary archive must not start demanding passwords: `NotEncrypted` is a
+/// separate answer from "the password happens to match".
+#[test]
+fn a_plain_archive_needs_no_password() {
+    let arc = build_archive(&sample_tree());
+    let a = StuffIt5Archive::open(&arc[..]).unwrap();
+    assert!(!a.is_encrypted());
+    assert_eq!(a.password_status(), PasswordStatus::NotEncrypted);
 }
 
 #[test]

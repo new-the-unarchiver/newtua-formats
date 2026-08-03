@@ -106,6 +106,21 @@ impl AlzEntry {
     }
 }
 
+/// What [`AlzArchive::password_status`] found: whether this archive needs a
+/// password at all, and whether the one it was opened with is the right one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordStatus {
+    /// No member is encrypted; no password is needed.
+    NotEncrypted,
+    /// At least one member is encrypted, and the archive was opened without a
+    /// password.
+    Missing,
+    /// A password was given and the check byte disagrees with it.
+    Wrong,
+    /// A password was given and the check byte agrees.
+    Correct,
+}
+
 /// A parsed ALZip archive.
 pub struct AlzArchive {
     data: Vec<u8>,
@@ -170,6 +185,34 @@ impl AlzArchive {
     /// The members, in archive order.
     pub fn entries(&self) -> &[AlzEntry] {
         &self.entries
+    }
+
+    /// Check the password remembered by
+    /// [`open_with_password`](Self::open_with_password) against the first
+    /// encrypted member's ZipCrypto check byte, **decoding nothing**.
+    ///
+    /// This lets a caller refuse before it writes the first byte to disk,
+    /// instead of failing mid-extraction with half the files already out. The
+    /// check byte is one byte wide, so a wrong password slips through about
+    /// once in 256 tries and is then caught by the member's CRC-32 — the same
+    /// bargain every ZipCrypto reader makes.
+    pub fn password_status(&self) -> PasswordStatus {
+        let Some(e) = self.entries.iter().find(|e| e.is_encrypted) else {
+            return PasswordStatus::NotEncrypted;
+        };
+        let Some(password) = self.password.as_deref() else {
+            return PasswordStatus::Missing;
+        };
+        // Only the 12-byte header is needed; hand over exactly that, so the
+        // check costs the same on a 2 GB member as on a 2 KB one.
+        let header = self
+            .data
+            .get(e.data_offset..e.data_offset + 12)
+            .unwrap_or(&[]);
+        match zipcrypt::decrypt(header, password, (e.crc32 >> 24) as u8) {
+            Ok(_) => PasswordStatus::Correct,
+            Err(_) => PasswordStatus::Wrong,
+        }
     }
 
     /// Decode member `idx` and write it to `out`, verifying its CRC-32.
@@ -892,6 +935,42 @@ mod tests {
         let mut a = HEADER.to_vec();
         a.extend_from_slice(&rec);
         assert!(AlzArchive::open(&a[..]).is_err());
+    }
+
+    /// The password can be judged from the member header alone, before any
+    /// decoding — which is what lets an extractor refuse up front rather than
+    /// stop halfway with files already written.
+    #[test]
+    fn password_status_answers_before_anything_is_decoded() {
+        let a = archive(&[encrypted_record(b"s", 0, b"secret", b"secret", b"pw")]);
+
+        assert_eq!(
+            AlzArchive::open(&a[..]).unwrap().password_status(),
+            PasswordStatus::Missing
+        );
+        assert_eq!(
+            AlzArchive::open_with_password(&a[..], b"pw")
+                .unwrap()
+                .password_status(),
+            PasswordStatus::Correct
+        );
+        // One byte of check means a wrong password slips through about once in
+        // 256; "nope" is one that does not, so the assertion stays honest.
+        assert_eq!(
+            AlzArchive::open_with_password(&a[..], b"nope")
+                .unwrap()
+                .password_status(),
+            PasswordStatus::Wrong
+        );
+    }
+
+    #[test]
+    fn an_archive_without_encryption_needs_no_password() {
+        let a = archive(&[file_record(b"x", 0, crc32_ieee(b"X"), b"X", 1, 4)]);
+        assert_eq!(
+            AlzArchive::open(&a[..]).unwrap().password_status(),
+            PasswordStatus::NotEncrypted
+        );
     }
 
     #[test]
