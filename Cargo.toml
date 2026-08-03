@@ -22,7 +22,7 @@ categories = ["compression", "parser-implementations"]
 keywords = ["archive", "decompression", "retro", "legacy"]
 
 [workspace.dependencies]
-newtua-common = { path = "crates/newtua-common", version = "0.1.0" }
+newtua-common = { path = "crates/newtua-common", version = "0.1.2" }
 newtua-testutil = { path = "crates/newtua-testutil" }
 
 # Keep line tables (so panics and test failures still point at a source line)
