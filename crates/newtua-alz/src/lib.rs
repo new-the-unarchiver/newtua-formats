@@ -67,6 +67,7 @@ pub struct AlzEntry {
     method: u8,
     crc32: u32,
     size: u64,
+    dostime: u32,
     data_offset: usize,
     compsize: usize,
 }
@@ -92,6 +93,16 @@ impl AlzEntry {
     /// Uncompressed size in bytes.
     pub fn size(&self) -> u64 {
         self.size
+    }
+    /// The raw MS-DOS timestamp: the date word in the high 16 bits, the time
+    /// word in the low ones. `0` means the record carries none.
+    ///
+    /// Handed out raw on purpose. An MS-DOS field is wall-clock time with no
+    /// timezone attached, and only the extracting side knows which zone to read
+    /// it in — converting here would bake a guess into a library that has no
+    /// business making one.
+    pub fn dostime(&self) -> u32 {
+        self.dostime
     }
 }
 
@@ -321,7 +332,7 @@ fn parse(data: &[u8]) -> io::Result<Vec<AlzEntry>> {
 
         let namelen = rd_u16(data, &mut pos)? as usize;
         let attrs = rd_u8(data, &mut pos)?;
-        let _dostime = rd_u32(data, &mut pos)?;
+        let dostime = rd_u32(data, &mut pos)?;
         let flags = rd_u8(data, &mut pos)?;
         let _ = rd_u8(data, &mut pos)?; // one skipped byte
 
@@ -362,6 +373,7 @@ fn parse(data: &[u8]) -> io::Result<Vec<AlzEntry>> {
             method,
             crc32,
             size,
+            dostime,
             data_offset,
             compsize,
         });
@@ -514,11 +526,24 @@ mod tests {
         comp: &[u8],
         size: u64,
     ) -> Vec<u8> {
+        record_with_flags_at(name, flags, method, crc, comp, size, 0)
+    }
+
+    /// As [`record_with_flags`], with an explicit MS-DOS timestamp word.
+    fn record_with_flags_at(
+        name: &[u8],
+        flags: u8,
+        method: u8,
+        crc: u32,
+        comp: &[u8],
+        size: u64,
+        dostime: u32,
+    ) -> Vec<u8> {
         let sizebytes = flags >> 4;
         let mut r = vec![b'B', b'L', b'Z', 0x01];
         r.extend_from_slice(&(name.len() as u16).to_le_bytes());
         r.push(0x00);
-        r.extend_from_slice(&0u32.to_le_bytes());
+        r.extend_from_slice(&dostime.to_le_bytes());
         r.push(flags);
         r.push(0x00);
         r.push(method);
@@ -867,5 +892,27 @@ mod tests {
         let mut a = HEADER.to_vec();
         a.extend_from_slice(&rec);
         assert!(AlzArchive::open(&a[..]).is_err());
+    }
+
+    #[test]
+    fn reports_the_raw_dos_timestamp() {
+        // 2012-07-04 09:15:44 as MS-DOS words: date = (2012-1980)<<9 | 7<<5 | 4,
+        // time = 9<<11 | 15<<5 | 44/2. The record stores date above time.
+        let date: u32 = ((2012 - 1980) << 9) | (7 << 5) | 4;
+        let time: u32 = (9 << 11) | (15 << 5) | 22;
+        let stamp = (date << 16) | time;
+
+        let a = archive(&[record_with_flags_at(b"x", 4 << 4, 0, 0, b"X", 1, stamp)]);
+        let arc = AlzArchive::open(&a[..]).unwrap();
+        assert_eq!(arc.entries()[0].dostime(), stamp);
+    }
+
+    #[test]
+    fn a_record_without_a_timestamp_reports_zero() {
+        // Zero is how the format spells "no date"; a caller must be able to tell
+        // that apart from a real instant rather than be handed a made-up one.
+        let a = archive(&[dir_record(b"folder")]);
+        let arc = AlzArchive::open(&a[..]).unwrap();
+        assert_eq!(arc.entries()[0].dostime(), 0);
     }
 }
