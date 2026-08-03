@@ -64,6 +64,9 @@ fn rd_u32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
 }
 
 /// One member of a Zoo archive.
+/// `NO_TZ` from zoo's `zoo.h`: the entry records no timezone.
+const NO_TZ: u8 = 127;
+
 pub struct ZooEntry {
     /// Full path as raw bytes (charset decoding is the caller's job): the long
     /// name when present, otherwise the short 8.3 name, prefixed by the stored
@@ -77,6 +80,7 @@ pub struct ZooEntry {
     is_deleted: bool,
     modification_date: u16,
     modification_time: u16,
+    timezone: Option<i8>,
 }
 
 impl ZooEntry {
@@ -104,6 +108,26 @@ impl ZooEntry {
     /// 4..0 seconds *divided by two* — the format has two-second resolution.
     pub fn modification_time(&self) -> u16 {
         self.modification_time
+    }
+
+    /// The timezone the file was archived in, in quarter-hour steps **west of
+    /// GMT** — so the UTC instant is the stored wall clock *plus* this many
+    /// quarter hours. `None` when the entry records none (`NO_TZ`, 127) or is
+    /// an old type-1 entry, which has no such field at all.
+    ///
+    /// Zoo is the one format here that writes the packer's timezone down, which
+    /// makes its MS-DOS date/time pair convertible to a real instant instead of
+    /// a bare wall-clock reading.
+    ///
+    /// The units and the direction are from zoo 2.1's own source, not inferred
+    /// from a sample: `zoolist.c::printtz` computes
+    /// `diff_tz = (file_tz / 4) - (gettz() / 3600)` — hence quarter hours — and
+    /// `gettz()` returns *seconds west of GMT* in both implementations shipped
+    /// with it (`bsd.c` uses `tzp.tz_minuteswest * 60`, `sysv.c` uses the SysV
+    /// `timezone` global). Both sides of that subtraction must therefore be
+    /// measured westward.
+    pub fn timezone(&self) -> Option<i8> {
+        self.timezone
     }
 
     /// Zoo stores no directory entries — directories appear only as path
@@ -243,10 +267,15 @@ fn parse(data: &[u8]) -> io::Result<Vec<ZooEntry>> {
         let mut longname: Option<Vec<u8>> = None;
         let mut dirname: Option<Vec<u8>> = None;
         let mut generation = 0u8;
+        // Only the type-2 entry carries a timezone; a type-1 one predates the
+        // field entirely.
+        let mut timezone: Option<i8> = None;
 
         if typ == 2 {
             let varlength = rd_u16(data, &mut pos)? as usize;
-            let _tzoffs = rd_u8(data, &mut pos)?;
+            // `NO_TZ` (127) means the packer did not record its zone.
+            let tzoffs = rd_u8(data, &mut pos)?;
+            timezone = (tzoffs != NO_TZ).then_some(tzoffs as i8);
             let _crcent = rd_u16(data, &mut pos)?;
 
             let longnamelength = if varlength >= 1 {
@@ -300,6 +329,7 @@ fn parse(data: &[u8]) -> io::Result<Vec<ZooEntry>> {
             is_deleted: deleted != 0,
             modification_date,
             modification_time,
+            timezone,
         });
 
         pos = nextdirentry;
@@ -422,6 +452,8 @@ mod tests {
         /// Слова даты и времени MS-DOS.
         modification_date: u16,
         modification_time: u16,
+        /// Байт `tzoffs` записи второго типа, как он лежит в архиве.
+        tzoffs: u8,
     }
 
     impl E {
@@ -440,6 +472,7 @@ mod tests {
                 data: c.to_vec(),
                 modification_date: 0,
                 modification_time: 0,
+                tzoffs: NO_TZ,
             }
         }
     }
@@ -485,7 +518,7 @@ mod tests {
             };
 
             r.extend_from_slice(&varlength.to_le_bytes());
-            r.push(0); // tzoffs
+            r.push(e.tzoffs);
             r.extend_from_slice(&[0, 0]); // crcent
             r.extend_from_slice(&content);
         }
@@ -601,6 +634,47 @@ mod tests {
         let zoo = build_zoo(&[e]);
         let arc = ZooArchive::open(&zoo[..]).unwrap();
         assert_eq!(arc.entries()[0].name(), b"a-much-longer-name.txt");
+    }
+
+    #[test]
+    fn type2_reports_the_timezone_as_stored() {
+        // 16 quarter hours = four hours west of GMT — what a file archived on
+        // the US east coast in summer carries.
+        let mut e = E::stored(2, "F.TXT", b"data");
+        e.tzoffs = 16;
+        let zoo = build_zoo(&[e]);
+        let arc = ZooArchive::open(&zoo[..]).unwrap();
+        assert_eq!(arc.entries()[0].timezone(), Some(16));
+    }
+
+    #[test]
+    fn a_zone_east_of_gmt_is_negative() {
+        // Zoo writes the byte as signed: 0xFC is -4 quarter hours, i.e. one
+        // hour *east*. Reading it unsigned would put the file 63 hours away.
+        let mut e = E::stored(2, "F.TXT", b"data");
+        e.tzoffs = 0xFC;
+        let zoo = build_zoo(&[e]);
+        let arc = ZooArchive::open(&zoo[..]).unwrap();
+        assert_eq!(arc.entries()[0].timezone(), Some(-4));
+    }
+
+    #[test]
+    fn no_tz_is_no_timezone() {
+        // 127 is zoo's NO_TZ: the packer did not record its zone, and that is
+        // not the same as "GMT" — the caller has to fall back to reading the
+        // wall clock locally.
+        let mut e = E::stored(2, "F.TXT", b"data");
+        e.tzoffs = NO_TZ;
+        let zoo = build_zoo(&[e]);
+        let arc = ZooArchive::open(&zoo[..]).unwrap();
+        assert_eq!(arc.entries()[0].timezone(), None);
+    }
+
+    #[test]
+    fn a_type1_entry_has_no_timezone_field_at_all() {
+        let zoo = build_zoo(&[E::stored(1, "F.TXT", b"data")]);
+        let arc = ZooArchive::open(&zoo[..]).unwrap();
+        assert_eq!(arc.entries()[0].timezone(), None);
     }
 
     #[test]
